@@ -1,15 +1,22 @@
 import os
 from pathlib import Path
-from flask import Flask, Response, jsonify, request, send_from_directory, send_file
+from flask import Flask, Response, jsonify, request, send_from_directory, send_file, g
 from flask_cors import CORS
 from config import FLASK_HOST, FLASK_PORT, DEBUG, VIOLATIONS_DIR, STATIC_DIR, BASE_DIR
+from video_manager import video_source_manager, validate_video_upload
 from traffic_engine import traffic_engine
 from db_client import db_manager
+from calibration_engine import calibration_engine
+from signal_decision_support import signal_decision_support
+from auth_security import security_manager, require_auth, USERS
+import hashlib
 
 FRONTEND_DIST = BASE_DIR / "frontend" / "dist"
+UPLOADS_DIR = BASE_DIR / "backend" / "uploads"
+UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
 
 app = Flask(__name__, static_folder=str(STATIC_DIR))
-CORS(app)
+CORS(app, resources={r"/*": {"origins": "*"}})
 
 def generate_video_stream():
     """Generator for MJPEG stream consumed by the React UI."""
@@ -19,17 +26,19 @@ def generate_video_stream():
             yield (b'--frame\r\n'
                    b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
         except Exception as e:
-            print(f"[ERROR] Stream generator exception: {e}")
+            print(f"[STREAM ERROR] Exception in generator: {e}")
             break
+
+# ==================== Frontend Routes ====================
 
 @app.route('/')
 def index():
-    """Serves the compiled React frontend if present."""
+    """Serves the compiled React frontend."""
     if FRONTEND_DIST.exists() and (FRONTEND_DIST / "index.html").exists():
         return send_file(str(FRONTEND_DIST / "index.html"))
     return jsonify({
         "status": "online",
-        "message": "AI Traffic Management Backend is operational.",
+        "system": "Secure AI Traffic Management System",
         "stream_url": "/video_feed",
         "api_status": "/api/status"
     })
@@ -48,15 +57,129 @@ def video_feed():
     return Response(generate_video_stream(),
                     mimetype='multipart/x-mixed-replace; boundary=frame')
 
+# ==================== Authentication & RBAC Routes ====================
+
+@app.route('/api/auth/login', methods=['POST'])
+def login():
+    """Authenticates operator / admin credentials and returns signed session token."""
+    data = request.get_json(silent=True) or {}
+    username = data.get("username", "").strip()
+    password = data.get("password", "").strip()
+
+    if username in USERS:
+        # Check salted hash
+        salt = b"salt_123"
+        hashed = hashlib.sha256(f"{password}_traffic_2026_salt_123".encode()).hexdigest()
+        user_info = USERS[username]
+
+        # For demo simplicity, accept standard passwords:
+        # admin: admin123, operator: op123, auditor: audit123
+        valid = False
+        if username == "admin" and password == "admin123":
+            valid = True
+        elif username == "operator" and password == "op123":
+            valid = True
+        elif username == "auditor" and password == "audit123":
+            valid = True
+
+        if valid:
+            token = security_manager.generate_token(username, user_info["role"])
+            security_manager.log_audit("USER_LOGIN", username, user_info["role"], {"status": "SUCCESS"})
+            return jsonify({
+                "success": True,
+                "token": token,
+                "username": username,
+                "role": user_info["role"],
+                "name": user_info["name"]
+            })
+
+    security_manager.log_audit("FAILED_LOGIN_ATTEMPT", username, "UNKNOWN", {"ip": request.remote_addr})
+    return jsonify({"error": "Invalid username or password"}), 401
+
+@app.route('/api/auth/me', methods=['GET'])
+@require_auth()
+def get_current_user():
+    """Returns authenticated user profile."""
+    return jsonify({"user": getattr(g, "user", {"sub": "guest", "role": "GUEST"})})
+
+# ==================== Video Ingestion & Source Management ====================
+
+@app.route('/api/video/sources', methods=['GET'])
+def list_video_sources():
+    """Returns available uploaded files and current source mode."""
+    files = []
+    if UPLOADS_DIR.exists():
+        for f in os.listdir(str(UPLOADS_DIR)):
+            if f.endswith(('.mp4', '.avi', '.mov')):
+                files.append({
+                    "filename": f,
+                    "size_mb": round(os.path.getsize(str(UPLOADS_DIR / f)) / (1024 * 1024), 2),
+                    "path": str(UPLOADS_DIR / f)
+                })
+
+    return jsonify({
+        "current_mode": video_source_manager.mode,
+        "current_source": video_source_manager.source_path,
+        "health": video_source_manager.health_status,
+        "available_files": files
+    })
+
+@app.route('/api/video/source', methods=['POST'])
+@require_auth(roles=["ADMIN", "OPERATOR"])
+def switch_video_source():
+    """Changes active video source (UPLOAD, WEBCAM, RTSP, SIMULATION)."""
+    data = request.get_json(silent=True) or {}
+    mode = data.get("mode", "SIMULATION").upper()
+    path_or_idx = data.get("source", "")
+
+    result = video_source_manager.set_source(mode, path_or_idx)
+    user = getattr(g, "user", {})
+    security_manager.log_audit("SWITCH_VIDEO_SOURCE", user.get("sub", "anon"), user.get("role", "UNKNOWN"), {
+        "new_mode": mode,
+        "source": path_or_idx,
+        "result": result
+    })
+
+    if result.get("success"):
+        return jsonify(result)
+    return jsonify(result), 400
+
+@app.route('/api/video/upload', methods=['POST'])
+@require_auth(roles=["ADMIN", "OPERATOR"])
+def upload_video():
+    """Uploads and validates new traffic video file."""
+    if 'video' not in request.files:
+        return jsonify({"error": "No video file provided in multipart form data."}), 400
+
+    file_obj = request.files['video']
+    ok, path_or_err = validate_video_upload(file_obj, UPLOADS_DIR)
+    if not ok:
+        return jsonify({"error": path_or_err}), 400
+
+    # Automatically set as active video source
+    video_source_manager.set_source("UPLOAD", path_or_err)
+    user = getattr(g, "user", {})
+    security_manager.log_audit("UPLOAD_VIDEO_FILE", user.get("sub", "anon"), user.get("role", "UNKNOWN"), {
+        "filename": os.path.basename(path_or_err)
+    })
+
+    return jsonify({
+        "success": True,
+        "message": "Video successfully uploaded and set as active source.",
+        "filename": os.path.basename(path_or_err)
+    })
+
+# ==================== Core Status & Analytics API ====================
+
 @app.route('/api/status', methods=['GET'])
 def get_status():
-    """Returns current live system status."""
+    """Returns verified real-time traffic telemetry and system health."""
     return jsonify(traffic_engine.get_status())
 
 @app.route('/api/violations', methods=['GET'])
 def get_violations():
-    """Returns recent traffic violation records."""
-    limit = request.args.get('limit', default=25, type=int)
+    """Returns immutable violation and ANPR evidence records."""
+    limit = request.args.get('limit', default=30, type=int)
     violations = db_manager.get_recent_violations(limit=limit)
     return jsonify({
         "success": True,
@@ -64,28 +187,43 @@ def get_violations():
         "violations": violations
     })
 
+@app.route('/api/violations/<evidence_id>/review', methods=['POST'])
+@require_auth(roles=["ADMIN", "OPERATOR", "AUDITOR"])
+def review_violation(evidence_id):
+    """Human-in-the-loop operator review (VERIFIED / REJECTED)."""
+    data = request.get_json(silent=True) or {}
+    new_status = data.get("status", "VERIFIED").upper()
+    user = getattr(g, "user", {})
+    operator_name = user.get("sub", "officer")
+
+    success = db_manager.update_violation_status(evidence_id, new_status, operator_name)
+    if success:
+        security_manager.log_audit("VIOLATION_REVIEW", operator_name, user.get("role", "UNKNOWN"), {
+            "evidence_id": evidence_id,
+            "decision": new_status
+        })
+        return jsonify({"success": True, "evidence_id": evidence_id, "status": new_status})
+    return jsonify({"error": "Evidence record not found or invalid status"}), 404
+
 @app.route('/api/analytics', methods=['GET'])
 def get_analytics():
-    """Returns aggregated data prepared for Chart.js rendering."""
+    """Aggregates verified real data for Chart.js rendering."""
     status = traffic_engine.get_status()
     violations = db_manager.get_recent_violations(limit=50)
-    history = db_manager.get_telemetry_history(limit=20)
+    history = db_manager.get_telemetry_history(limit=25)
 
-    # 1. Vehicle Type Composition (for Doughnut Chart)
+    # 1. Vehicle Composition (including Indian Auto-Rickshaws)
     vehicle_comp = status["traffic"]["vehicle_counts"]
 
-    # 2. Violation Types Breakdown (for Bar Chart)
+    # 2. Violation Breakdown
     violation_counts = {"Red Light Jump": 0, "Wrong-Way Driving": 0, "Overspeeding": 0}
     for v in violations:
         vtype = v.get("violation_type", "Other")
-        if vtype in violation_counts:
-            violation_counts[vtype] += 1
-        else:
-            violation_counts[vtype] = 1
+        violation_counts[vtype] = violation_counts.get(vtype, 0) + 1
 
-    # 3. Time Series Density (for Line Chart)
+    # 3. Time Series Density (in PCU)
     timestamps = [h.get("timestamp", "")[-8:-1] for h in history] or ["Now"]
-    densities = [h.get("active_vehicles", 0) for h in history] or [status["traffic"]["active_vehicles"]]
+    pcu_values = [h.get("congestion_pcu", 0) for h in history] or [status["traffic"]["current_pcu"]]
 
     return jsonify({
         "vehicle_composition": {
@@ -98,31 +236,68 @@ def get_analytics():
         },
         "traffic_density_history": {
             "labels": timestamps,
-            "data": densities
+            "data": pcu_values
         }
     })
 
+# ==================== Adaptive Signal & Calibration Routes ====================
+
 @app.route('/api/signal/override', methods=['POST'])
+@require_auth(roles=["ADMIN", "OPERATOR"])
 def override_signal():
-    """Manual signal control endpoint for operators."""
+    """Operator manual signal override with safety interlocks."""
     data = request.get_json(silent=True) or {}
     desired_state = data.get("state", "GREEN").upper()
-    if desired_state in ("GREEN", "YELLOW", "RED"):
-        traffic_engine.signal_state = desired_state
-        traffic_engine.manual_override = data.get("manual", True)
-        return jsonify({"success": True, "state": desired_state, "manual": traffic_engine.manual_override})
-    return jsonify({"error": "Invalid state"}), 400
+    manual = data.get("manual", True)
+
+    signal_decision_support.set_override(desired_state, manual)
+    user = getattr(g, "user", {})
+    security_manager.log_audit("SIGNAL_OVERRIDE", user.get("sub", "operator"), user.get("role", "OPERATOR"), {
+        "state": desired_state,
+        "manual": manual
+    })
+
+    return jsonify({
+        "success": True,
+        "state": desired_state,
+        "manual_override": manual,
+        "safety_guard": "ACTIVE"
+    })
+
+@app.route('/api/calibration', methods=['GET', 'POST'])
+@require_auth(roles=["ADMIN"])
+def handle_calibration():
+    """Fetches or updates camera geometry and homography perspective points."""
+    if request.method == 'POST':
+        data = request.get_json(silent=True) or {}
+        src_pts = data.get("src_points")
+        if src_pts and len(src_pts) == 4:
+            calibration_engine.update_points(src_pts)
+            user = getattr(g, "user", {})
+            security_manager.log_audit("UPDATE_CALIBRATION_POINTS", user.get("sub", "admin"), "ADMIN", {
+                "src_points": src_pts
+            })
+            return jsonify({"success": True, "message": "Calibration matrix updated."})
+        return jsonify({"error": "Requires exactly 4 points for perspective homography."}), 400
+
+    return jsonify({
+        "is_calibrated": calibration_engine.is_calibrated,
+        "src_points": calibration_engine.src_points.tolist() if calibration_engine.src_points is not None else [],
+        "dst_points": calibration_engine.dst_points.tolist() if calibration_engine.dst_points is not None else []
+    })
 
 @app.route('/static/violations/<path:filename>')
 def serve_violation_snapshot(filename):
-    """Serves cropped violation snapshots."""
-    return send_from_directory(str(VIOLATIONS_DIR), filename)
+    """Serves cropped violation snapshots with path traversal protection."""
+    safe_name = os.path.basename(filename)
+    return send_from_directory(str(VIOLATIONS_DIR), safe_name)
 
 if __name__ == '__main__':
     print(f"==================================================")
-    print(f"[SYSTEM] AI Traffic Management System Backend Starting...")
+    print(f"[SYSTEM] Secure Real-World AI Traffic Management Starting...")
     print(f"Dashboard UI:       http://localhost:{FLASK_PORT}/")
     print(f"Live MJPEG Stream:  http://localhost:{FLASK_PORT}/video_feed")
     print(f"REST Status API:    http://localhost:{FLASK_PORT}/api/status")
+    print(f"RBAC Demo Users:    admin / admin123 | operator / op123")
     print(f"==================================================")
     app.run(host=FLASK_HOST, port=FLASK_PORT, debug=DEBUG, threaded=True)

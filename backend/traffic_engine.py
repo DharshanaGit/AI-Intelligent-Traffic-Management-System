@@ -1,27 +1,23 @@
 import cv2
 import numpy as np
 import time
-import os
-import uuid
-from typing import Dict, List, Tuple
-from config import MODEL_PATH, VIOLATIONS_DIR
+from typing import Dict, List, Tuple, Any, Optional
+from config import MODEL_PATH
+from video_manager import video_source_manager
+from calibration_engine import calibration_engine
+from anpr_evidence import anpr_evidence_manager
+from signal_decision_support import signal_decision_support
 from db_client import db_manager
 
-COCO_CLASSES = [
-    'person', 'bicycle', 'car', 'motorcycle', 'airplane', 'bus', 'train', 'truck', 'boat',
-    'traffic light', 'fire hydrant', 'stop sign', 'parking meter', 'bench', 'bird', 'cat',
-    'dog', 'horse', 'sheep', 'cow', 'elephant', 'bear', 'zebra', 'giraffe', 'backpack',
-    'umbrella', 'handbag', 'tie', 'suitcase', 'frisbee', 'skis', 'snowboard', 'sports ball',
-    'kite', 'baseball bat', 'baseball glove', 'skateboard', 'surfboard', 'tennis racket',
-    'bottle', 'wine glass', 'cup', 'fork', 'knife', 'spoon', 'bowl', 'banana', 'apple',
-    'sandwich', 'orange', 'broccoli', 'carrot', 'hot dog', 'pizza', 'donut', 'cake',
-    'chair', 'couch', 'potted plant', 'bed', 'dining table', 'toilet', 'tv', 'laptop',
-    'mouse', 'remote', 'keyboard', 'cell phone', 'microwave', 'oven', 'toaster', 'sink',
-    'refrigerator', 'book', 'clock', 'vase', 'scissors', 'teddy bear', 'hair drier', 'toothbrush'
-]
-
-# Vehicle classes to monitor
-TARGET_VEHICLE_CLASSES = {2: 'Car', 3: 'Motorcycle', 5: 'Bus', 7: 'Truck'}
+# Target vehicle classes from standard COCO
+TARGET_VEHICLE_CLASSES = {
+    0: 'Person',
+    1: 'Bicycle',
+    2: 'Car',
+    3: 'Motorcycle',
+    5: 'Bus',
+    7: 'Truck'
+}
 
 class TrafficEngine:
     def __init__(self):
@@ -30,112 +26,39 @@ class TrafficEngine:
         self.net.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
         self.net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
 
-        # Tracking state
+        # Multi-Object Tracker State
         self.next_vehicle_id = 1
-        self.tracked_vehicles: Dict[int, dict] = {}  # id -> {centroid, bbox, class_name, trajectory, speed, violated}
-        self.max_disappeared = 10
+        self.tracked_vehicles: Dict[int, dict] = {}
+        self.max_disappeared = 12
 
-        # Frame skip management
+        # Frame Skipping for High CPU FPS
         self.frame_index = 0
         self.skip_frames = 2  # Run inference every 3rd frame
         self.cached_boxes = []
         self.cached_confidences = []
         self.cached_classes = []
 
-        # Virtual Lines & Zones (for 640x480 resolution)
-        self.stop_line_y = 330
-        self.speed_trap_y1 = 200
-        self.speed_trap_y2 = 330
-        self.distance_meters = 12.0  # Assumed distance between speed trap lines
-
-        # Signal Controller State
-        self.signal_state = "GREEN"  # GREEN, YELLOW, RED
-        self.signal_duration = 15
-        self.signal_timer_start = time.time()
-        self.manual_override = False
+        # Geometry & Road Boundaries (Polygonal Stop-Line Zone)
+        self.stop_line_p1 = (90, 340)
+        self.stop_line_p2 = (550, 340)
+        
+        # Debounce / Deduplication map: (vid, vtype) -> timestamp
+        self.violation_debounce: Dict[str, float] = {}
+        self.debounce_window_seconds = 15.0
 
         # Live Metrics
-        self.vehicle_counts = {"Car": 0, "Motorcycle": 0, "Bus": 0, "Truck": 0}
+        self.vehicle_counts = {"Car": 0, "Motorcycle": 0, "Auto-Rickshaw": 0, "Bus": 0, "Truck": 0, "Person": 0}
         self.total_counted = 0
         self.congestion_level = "Low"
         self.current_fps = 0.0
         self.last_fps_time = time.time()
         self.fps_frame_counter = 0
 
-        # Procedural simulator state for fallback/independent testing
-        self.sim_vehicles = []
-        self._init_simulator()
-
-    def _init_simulator(self):
-        """Initializes procedural traffic generator with realistic vehicle objects."""
-        lanes = [140, 260, 380, 500]
-        types = [
-            ("Car", (45, 80), (220, 160, 50), 3.0),
-            ("Bus", (60, 140), (40, 180, 40), 2.2),
-            ("Truck", (60, 120), (50, 100, 220), 2.0),
-            ("Motorcycle", (25, 45), (180, 50, 200), 3.8)
-        ]
-        for i in range(7):
-            lane_x = lanes[i % len(lanes)]
-            vtype, size, color, speed = types[i % len(types)]
-            self.sim_vehicles.append({
-                "x": lane_x - size[0]//2,
-                "y": np.random.randint(50, 400),
-                "w": size[0],
-                "h": size[1],
-                "color": color,
-                "speed": speed + np.random.uniform(-0.5, 0.8),
-                "type": vtype,
-                "wrong_way": (i == 4)  # 1 vehicle programmed for wrong-way demo
-            })
-
-    def _update_simulator(self):
-        """Renders procedural urban traffic when no external webcam/video is plugged."""
-        frame = np.full((480, 640, 3), 45, dtype=np.uint8)
-
-        # Draw road tarmac and lane dividers
-        cv2.rectangle(frame, (80, 0), (560, 480), (55, 55, 55), -1)
-        # Road borders
-        cv2.line(frame, (80, 0), (80, 480), (240, 240, 240), 3)
-        cv2.line(frame, (560, 0), (560, 480), (240, 240, 240), 3)
-        # Lane dashes
-        for x in (200, 320, 440):
-            for y in range(0, 480, 40):
-                cv2.line(frame, (x, y), (x, y + 20), (200, 200, 200), 2)
-
-        # Update and draw moving simulated vehicles
-        for v in self.sim_vehicles:
-            if v["wrong_way"]:
-                v["y"] -= int(v["speed"])
-                if v["y"] < -v["h"]:
-                    v["y"] = 480 + 20
-            else:
-                # Stop if red light and close to stop line
-                if self.signal_state == "RED" and 250 < v["y"] + v["h"] <= self.stop_line_y:
-                    pass  # Stopped at light
-                else:
-                    v["y"] += int(v["speed"])
-                    if v["y"] > 480:
-                        v["y"] = -v["h"] - np.random.randint(20, 100)
-
-            # Draw vehicle body & details
-            x, y, w, h = int(v["x"]), int(v["y"]), int(v["w"]), int(v["h"])
-            cv2.rectangle(frame, (x, y), (x + w, y + h), v["color"], -1)
-            cv2.rectangle(frame, (x, y), (x + w, y + h), (255, 255, 255), 2)
-            # Windshield
-            cv2.rectangle(frame, (x + 4, y + 8), (x + w - 4, y + 20), (220, 220, 240), -1)
-            # Headlights / taillights
-            cv2.circle(frame, (x + 8, y + h - 6), 3, (0, 0, 255), -1)
-            cv2.circle(frame, (x + w - 8, y + h - 6), 3, (0, 0, 255), -1)
-
-        return frame
-
     def run_detection(self, frame: np.ndarray):
-        """Runs YOLOv5n inference on 640x480 frame with frame-skipping."""
+        """Runs YOLOv5n ONNX inference on 640x480 frame."""
         self.frame_index += 1
         h, w = frame.shape[:2]
 
-        # Execute deep learning forward pass every N frames
         if self.frame_index % (self.skip_frames + 1) == 0 or len(self.cached_boxes) == 0:
             blob = cv2.dnn.blobFromImage(frame, 1/255.0, (640, 640), swapRB=True, crop=False)
             self.net.setInput(blob)
@@ -147,11 +70,11 @@ class TrafficEngine:
 
             for row in outputs:
                 conf = row[4]
-                if conf >= 0.25:
+                if conf >= 0.28:
                     scores = row[5:]
                     class_id = int(np.argmax(scores))
                     score = float(scores[class_id])
-                    if score >= 0.25 and class_id in TARGET_VEHICLE_CLASSES:
+                    if score >= 0.28 and class_id in TARGET_VEHICLE_CLASSES:
                         cx, cy, bw, bh = row[0:4]
                         x = int((cx - bw / 2) * (w / 640))
                         y = int((cy - bh / 2) * (h / 640))
@@ -159,28 +82,40 @@ class TrafficEngine:
                         confidences.append(float(conf * score))
                         class_ids.append(class_id)
 
-            indices = cv2.dnn.NMSBoxes(boxes, confidences, 0.25, 0.45)
+            indices = cv2.dnn.NMSBoxes(boxes, confidences, 0.28, 0.45)
             self.cached_boxes = []
             self.cached_confidences = []
             self.cached_classes = []
 
             if len(indices) > 0:
                 for idx in indices.flatten():
-                    self.cached_boxes.append(boxes[idx])
+                    bbox = boxes[idx]
+                    raw_class = TARGET_VEHICLE_CLASSES[class_ids[idx]]
+                    # Indian Traffic Harmonization: Auto-Rickshaw detection heuristic
+                    # Auto-rickshaws have narrow track, compact size, aspect ratio ~0.65-0.78
+                    bw, bh = bbox[2], bbox[3]
+                    aspect = float(bw) / float(bh) if bh > 0 else 1.0
+                    if raw_class in ("Car", "Motorcycle") and 0.60 <= aspect <= 0.85 and 2000 < (bw * bh) < 12000:
+                        refined_class = "Auto-Rickshaw"
+                    else:
+                        refined_class = raw_class
+
+                    self.cached_boxes.append(bbox)
                     self.cached_confidences.append(confidences[idx])
-                    self.cached_classes.append(TARGET_VEHICLE_CLASSES[class_ids[idx]])
+                    self.cached_classes.append(refined_class)
 
         return self.cached_boxes, self.cached_confidences, self.cached_classes
 
-    def update_tracking_and_violations(self, frame: np.ndarray, boxes: List[list], classes: List[str]):
-        """Matches centroids to persistent vehicle IDs and runs rule violation algorithms."""
+    def update_tracking(self, frame: np.ndarray, boxes: List[list], classes: List[str]):
+        """Associates detections with persistent vehicle IDs and updates trajectory history."""
         current_centroids = []
         for b in boxes:
             x, y, bw, bh = b
             current_centroids.append((x + bw // 2, y + bh // 2))
 
-        # Centroid matching
         updated_ids = set()
+        now = time.time()
+
         for idx, (cx, cy) in enumerate(current_centroids):
             bbox = boxes[idx]
             vtype = classes[idx]
@@ -192,23 +127,33 @@ class TrafficEngine:
                     continue
                 prev_cx, prev_cy = data["centroid"]
                 dist = np.hypot(cx - prev_cx, cy - prev_cy)
-                if dist < 65 and dist < min_dist:
+                if dist < 60 and dist < min_dist:
                     min_dist = dist
                     matched_id = vid
 
             if matched_id is not None:
-                # Update existing vehicle
+                # Update tracklet
                 v = self.tracked_vehicles[matched_id]
+                prev_pt = v["centroid"]
+                prev_time = v.get("last_seen_time", now - 0.05)
+                dt = max(0.01, now - prev_time)
+                
+                # Calibrated Speed Calculation via Perspective Homography
+                calibrated_speed = calibration_engine.calculate_speed_kmh(prev_pt, (cx, cy), dt)
+                if calibrated_speed is not None and 5.0 <= calibrated_speed <= 140.0:
+                    v["speed"] = calibrated_speed
+
                 v["trajectory"].append((cx, cy))
                 if len(v["trajectory"]) > 10:
                     v["trajectory"].pop(0)
-                v["disappeared"] = 0
                 v["bbox"] = bbox
                 v["centroid"] = (cx, cy)
+                v["last_seen_time"] = now
+                v["disappeared"] = 0
                 updated_ids.add(matched_id)
                 self._check_violations(frame, matched_id, v)
             else:
-                # New vehicle discovered
+                # New vehicle entering frame
                 new_id = self.next_vehicle_id
                 self.next_vehicle_id += 1
                 self.total_counted += 1
@@ -218,21 +163,22 @@ class TrafficEngine:
                     "bbox": bbox,
                     "class_name": vtype,
                     "trajectory": [(cx, cy)],
-                    "speed": round(np.random.uniform(40, 58), 1),
+                    "speed": None,
+                    "last_seen_time": now,
                     "disappeared": 0,
                     "violations": set()
                 }
                 updated_ids.add(new_id)
 
-        # Mark disappeared vehicles
+        # Age-out disappeared vehicles
         for vid in list(self.tracked_vehicles.keys()):
             if vid not in updated_ids:
                 self.tracked_vehicles[vid]["disappeared"] += 1
                 if self.tracked_vehicles[vid]["disappeared"] > self.max_disappeared:
                     del self.tracked_vehicles[vid]
 
-        # Update vehicle classification count
-        counts = {"Car": 0, "Motorcycle": 0, "Bus": 0, "Truck": 0}
+        # Aggregate counts
+        counts = {"Car": 0, "Motorcycle": 0, "Auto-Rickshaw": 0, "Bus": 0, "Truck": 0, "Person": 0}
         for v in self.tracked_vehicles.values():
             cname = v["class_name"]
             if cname in counts:
@@ -240,144 +186,111 @@ class TrafficEngine:
         self.vehicle_counts = counts
 
     def _check_violations(self, frame: np.ndarray, vid: int, vehicle: dict):
-        """Evaluates red-light jumping, wrong-way driving, and speed violations."""
+        """Evaluates rule violations with deduplication and evidence generation."""
         traj = vehicle["trajectory"]
         if len(traj) < 2:
             return
 
+        now = time.time()
         prev_cx, prev_cy = traj[-2]
         curr_cx, curr_cy = traj[-1]
         vtype = vehicle["class_name"]
+        signal_state = signal_decision_support.current_phase
 
-        # 1. Red Light Jump Rule
-        if self.signal_state == "RED" and "Red Light Jump" not in vehicle["violations"]:
-            # Check if crossed stop line going downwards
-            if prev_cy < self.stop_line_y <= curr_cy:
+        # 1. Red Light Jumping Rule
+        debounce_key_red = f"{vid}_RED_LIGHT"
+        if signal_state == "RED" and now - self.violation_debounce.get(debounce_key_red, 0) > self.debounce_window_seconds:
+            # Check crossing of stop-line
+            if prev_cy < self.stop_line_p1[1] <= curr_cy:
+                self.violation_debounce[debounce_key_red] = now
                 vehicle["violations"].add("Red Light Jump")
-                self._save_and_log_violation(frame, vid, "Red Light Jump", vtype, vehicle["bbox"])
+                self._record_evidence(frame, vid, "Red Light Jump", vtype, vehicle["bbox"], vehicle.get("speed"))
 
         # 2. Wrong-Way Driving Rule
-        if len(traj) >= 4 and "Wrong-Way Driving" not in vehicle["violations"]:
-            # Normal flow moves down (increasing y); if moving up steadily, trigger wrong-way
+        debounce_key_ww = f"{vid}_WRONG_WAY"
+        if len(traj) >= 5 and now - self.violation_debounce.get(debounce_key_ww, 0) > self.debounce_window_seconds:
+            # Downward is normal (+y). If moving steadily upward (-y), trigger wrong-way
             delta_y = curr_cy - traj[0][1]
-            if delta_y < -35:  # Moved upward significantly
+            if delta_y < -38:
+                self.violation_debounce[debounce_key_ww] = now
                 vehicle["violations"].add("Wrong-Way Driving")
-                self._save_and_log_violation(frame, vid, "Wrong-Way Driving", vtype, vehicle["bbox"])
+                self._record_evidence(frame, vid, "Wrong-Way Driving", vtype, vehicle["bbox"], vehicle.get("speed"))
 
-        # 3. Overspeeding Rule
-        if len(traj) >= 5 and "Overspeeding" not in vehicle["violations"]:
-            if vehicle["speed"] > 65.0:
-                vehicle["violations"].add("Overspeeding")
-                self._save_and_log_violation(frame, vid, "Overspeeding", vtype, vehicle["bbox"], speed=vehicle["speed"])
+        # 3. Overspeeding Rule (Requires Calibrated Homography Speed)
+        debounce_key_speed = f"{vid}_SPEED"
+        speed = vehicle.get("speed")
+        if speed and speed > 60.0 and now - self.violation_debounce.get(debounce_key_speed, 0) > self.debounce_window_seconds:
+            self.violation_debounce[debounce_key_speed] = now
+            vehicle["violations"].add("Overspeeding")
+            self._record_evidence(frame, vid, "Overspeeding", vtype, vehicle["bbox"], speed)
 
-    def _save_and_log_violation(self, frame: np.ndarray, vid: int, vtype: str, bbox: list, speed: float = None):
-        """Crops vehicle evidence snapshot and records incident to database."""
-        h, w = frame.shape[:2]
-        x, y, bw, bh = bbox
-        x1, y1 = max(0, x), max(0, y)
-        x2, y2 = min(w, x + bw), min(h, y + bh)
+    def _record_evidence(self, frame: np.ndarray, vid: int, vtype: str, 
+                         vclass: str, bbox: list, speed: Optional[float] = None):
+        """Seals evidence with SHA-256 and ANPR extraction, saving to database."""
+        evidence_record = anpr_evidence_manager.seal_and_store_evidence(
+            frame=frame,
+            vid=vid,
+            vtype=vtype,
+            vehicle_type=vclass,
+            bbox=bbox,
+            speed=speed
+        )
+        db_manager.log_violation(evidence_record)
+        print(f"[EVIDENCE STORED] #{evidence_record['evidence_id']} - {vtype} by {vclass} (Plate: {evidence_record['license_plate']})")
 
-        crop = frame[y1:y2, x1:x2]
-        if crop.size == 0:
-            crop = frame
+    def annotate_frame(self, frame: np.ndarray, meta: Dict[str, Any]) -> np.ndarray:
+        """Annotates frame with source health banner, calibration zones, vehicle tracking and signal HUD."""
+        out = frame.copy()
+        current_signal = signal_decision_support.current_phase
 
-        filename = f"violation_{vid}_{int(time.time()*1000)}.jpg"
-        filepath = VIOLATIONS_DIR / filename
-        cv2.imwrite(str(filepath), crop)
+        # 1. Truthful Stream Status Top Banner
+        mode_str = meta.get("mode", "UNKNOWN")
+        health_str = meta.get("health", "HEALTHY")
+        is_sim = meta.get("is_simulation", False)
+        
+        banner_color = (0, 0, 160) if is_sim else ((0, 140, 0) if health_str == "HEALTHY" else (0, 0, 200))
+        cv2.rectangle(out, (0, 0), (640, 26), banner_color, -1)
+        
+        source_label = f"SOURCE: {mode_str} | HEALTH: {health_str} | CALIBRATION: {'ACTIVE' if calibration_engine.is_calibrated else 'DISABLED'}"
+        cv2.putText(out, source_label, (12, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.44, (255, 255, 255), 1)
 
-        vehicle_type = self.tracked_vehicles[vid]["class_name"]
-        record = {
-            "vehicle_id": vid,
-            "violation_type": vtype,
-            "vehicle_class": vehicle_type,
-            "speed": speed or self.tracked_vehicles[vid]["speed"],
-            "snapshot_url": f"/static/violations/{filename}"
-        }
-        db_manager.log_violation(record)
-        print(f"[ALERT] Violation Recorded: {vtype} by Vehicle #{vid} ({vehicle_type})")
+        # 2. Virtual Stop-Line with Signal Awareness
+        line_col = (0, 0, 255) if current_signal == "RED" else (0, 255, 0)
+        cv2.line(out, self.stop_line_p1, self.stop_line_p2, line_col, 2)
+        cv2.putText(out, f"STOP LINE [{current_signal}]", (self.stop_line_p1[0], self.stop_line_p1[1] - 8),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.48, line_col, 2)
 
-    def update_dynamic_signal(self):
-        """Adaptive Webster-heuristic traffic signal controller."""
-        if self.manual_override:
-            return
-
-        elapsed = time.time() - self.signal_timer_start
-        active_count = len(self.tracked_vehicles)
-
-        # Dynamic Green calculation based on queue density
-        if self.signal_state == "GREEN":
-            # Congestion levels
-            if active_count > 10:
-                self.congestion_level = "High"
-                self.signal_duration = 35
-            elif active_count > 4:
-                self.congestion_level = "Medium"
-                self.signal_duration = 22
-            else:
-                self.congestion_level = "Low"
-                self.signal_duration = 12
-
-            if elapsed >= self.signal_duration:
-                self.signal_state = "YELLOW"
-                self.signal_duration = 3
-                self.signal_timer_start = time.time()
-
-        elif self.signal_state == "YELLOW":
-            if elapsed >= self.signal_duration:
-                self.signal_state = "RED"
-                self.signal_duration = 12  # Red cycle length
-                self.signal_timer_start = time.time()
-
-        elif self.signal_state == "RED":
-            if elapsed >= self.signal_duration:
-                self.signal_state = "GREEN"
-                self.signal_timer_start = time.time()
-
-    def annotate_frame(self, frame: np.ndarray) -> np.ndarray:
-        """Draws visual cues: stop lines, bounding boxes, labels, and traffic signals."""
-        output = frame.copy()
-
-        # 1. Draw Virtual Stop Line
-        line_color = (0, 0, 255) if self.signal_state == "RED" else (0, 255, 0)
-        cv2.line(output, (80, self.stop_line_y), (560, self.stop_line_y), line_color, 3)
-        cv2.putText(output, f"STOP LINE [Signal: {self.signal_state}]", (90, self.stop_line_y - 8),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, line_color, 2)
-
-        # 2. Draw Tracked Vehicles
+        # 3. Tracked Vehicles Annotations
         for vid, v in self.tracked_vehicles.items():
             x, y, w, h = v["bbox"]
             has_violation = len(v["violations"]) > 0
-            box_color = (0, 0, 255) if has_violation else (0, 220, 100)
+            box_col = (0, 0, 255) if has_violation else (0, 220, 120)
 
-            # Bounding box
-            cv2.rectangle(output, (x, y), (x + w, y + h), box_color, 2)
-
-            # Label badge
-            label = f"#{vid} {v['class_name']} {int(v['speed'])}km/h"
+            cv2.rectangle(out, (x, y), (x + w, y + h), box_col, 2)
+            speed_txt = f"{int(v['speed'])}km/h" if v.get("speed") else "Tracking"
+            label = f"#{vid} {v['class_name']} ({speed_txt})"
             if has_violation:
                 label += f" [{'|'.join(v['violations'])}]"
 
-            cv2.putText(output, label, (x, max(15, y - 6)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, box_color, 2)
+            cv2.putText(out, label, (x, max(16, y - 6)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.42, box_col, 1)
 
-        # 3. Draw Traffic Light HUD in Top-Right
-        hud_x, hud_y = 580, 40
-        cv2.rectangle(output, (hud_x - 15, hud_y - 25), (hud_x + 35, hud_y + 90), (20, 20, 20), -1)
-        cv2.rectangle(output, (hud_x - 15, hud_y - 25), (hud_x + 35, hud_y + 90), (180, 180, 180), 1)
+        # 4. Traffic Signal HUD (Top-Right)
+        hud_x, hud_y = 575, 45
+        cv2.rectangle(out, (hud_x - 10, hud_y - 15), (hud_x + 45, hud_y + 85), (25, 25, 25), -1)
+        cv2.rectangle(out, (hud_x - 10, hud_y - 15), (hud_x + 45, hud_y + 85), (160, 160, 160), 1)
 
-        # Signal bulbs: Red, Yellow, Green
-        r_col = (0, 0, 255) if self.signal_state == "RED" else (40, 40, 60)
-        y_col = (0, 220, 255) if self.signal_state == "YELLOW" else (40, 40, 60)
-        g_col = (0, 255, 0) if self.signal_state == "GREEN" else (40, 40, 60)
+        r_col = (0, 0, 255) if current_signal == "RED" else (50, 50, 70)
+        y_col = (0, 220, 255) if current_signal == "YELLOW" else (50, 50, 70)
+        g_col = (0, 255, 0) if current_signal == "GREEN" else (50, 50, 70)
 
-        cv2.circle(output, (hud_x + 10, hud_y - 5), 10, r_col, -1)
-        cv2.circle(output, (hud_x + 10, hud_y + 25), 10, y_col, -1)
-        cv2.circle(output, (hud_x + 10, hud_y + 55), 10, g_col, -1)
+        cv2.circle(out, (hud_x + 18, hud_y + 5), 8, r_col, -1)
+        cv2.circle(out, (hud_x + 18, hud_y + 28), 8, y_col, -1)
+        cv2.circle(out, (hud_x + 18, hud_y + 51), 8, g_col, -1)
 
-        # Countdown HUD
-        remaining = max(0, int(self.signal_duration - (time.time() - self.signal_timer_start)))
-        cv2.putText(output, f"{remaining}s", (hud_x - 2, hud_y + 82),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
+        status_sig = signal_decision_support.get_status()
+        cv2.putText(out, f"{status_sig.get('remaining_seconds', 0)}s", (hud_x + 8, hud_y + 78),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.44, (255, 255, 255), 1)
 
         # FPS calculation
         self.fps_frame_counter += 1
@@ -386,25 +299,26 @@ class TrafficEngine:
             self.fps_frame_counter = 0
             self.last_fps_time = time.time()
 
-        cv2.putText(output, f"FPS: {self.current_fps} | Density: {self.congestion_level}",
-                    (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-
-        return output
+        return out
 
     def get_frame(self) -> bytes:
-        """Main loop: generates/reads frame, detects, updates rules, and encodes to JPEG."""
-        raw_frame = self._update_simulator()
+        """Main pipeline execution loop for live video streaming."""
+        raw_frame, meta = video_source_manager.read_frame()
         boxes, confs, classes = self.run_detection(raw_frame)
-        self.update_tracking_and_violations(raw_frame, boxes, classes)
-        self.update_dynamic_signal()
-        annotated = self.annotate_frame(raw_frame)
+        self.update_tracking(raw_frame, boxes, classes)
+        
+        # Adaptive decision support progress
+        signal_decision_support.update_state(len(self.tracked_vehicles), self.vehicle_counts)
+        annotated = self.annotate_frame(raw_frame, meta)
 
-        # Periodic telemetry logging to DB (every 30 frames)
+        # Log rolling telemetry every 30 frames
         if self.frame_index % 30 == 0:
             db_manager.log_telemetry({
                 "active_vehicles": len(self.tracked_vehicles),
-                "congestion_level": self.congestion_level,
-                "signal_state": self.signal_state,
+                "vehicle_counts": self.vehicle_counts,
+                "congestion_pcu": signal_decision_support.compute_lane_pcu(self.vehicle_counts),
+                "signal_phase": signal_decision_support.current_phase,
+                "stream_health": meta.get("health", "HEALTHY"),
                 "fps": self.current_fps
             })
 
@@ -412,21 +326,29 @@ class TrafficEngine:
         return buffer.tobytes()
 
     def get_status(self) -> dict:
-        """Returns JSON state for the frontend dashboard."""
-        remaining = max(0, int(self.signal_duration - (time.time() - self.signal_timer_start)))
+        """Assembles verified real-time status payload for dashboard."""
+        meta_source = {
+            "mode": video_source_manager.mode,
+            "source_path": video_source_manager.source_path,
+            "health": video_source_manager.health_status,
+            "measured_fps": video_source_manager.measured_fps,
+            "is_simulation": (video_source_manager.mode == "SIMULATION")
+        }
+        sig_status = signal_decision_support.get_status()
+
         return {
-            "signal": {
-                "state": self.signal_state,
-                "remaining_seconds": remaining,
-                "duration": self.signal_duration,
-                "manual_override": self.manual_override
-            },
+            "source": meta_source,
+            "signal": sig_status,
             "traffic": {
                 "active_vehicles": len(self.tracked_vehicles),
                 "total_counted": self.total_counted,
-                "congestion_level": self.congestion_level,
-                "fps": self.current_fps,
-                "vehicle_counts": self.vehicle_counts
+                "vehicle_counts": self.vehicle_counts,
+                "current_pcu": signal_decision_support.compute_lane_pcu(self.vehicle_counts),
+                "fps": self.current_fps
+            },
+            "calibration": {
+                "calibrated": calibration_engine.is_calibrated,
+                "metric_trap_meters": 25.0
             },
             "database": db_manager.get_status()
         }
