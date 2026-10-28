@@ -1,4 +1,5 @@
 import os
+from datetime import datetime
 from pathlib import Path
 from flask import Flask, Response, jsonify, request, send_from_directory, send_file, g
 from flask_cors import CORS
@@ -9,6 +10,7 @@ from db_client import db_manager
 from calibration_engine import calibration_engine
 from signal_decision_support import signal_decision_support
 from auth_security import security_manager, require_auth, USERS
+from alert_service import alert_service
 import hashlib
 
 FRONTEND_DIST = BASE_DIR / "frontend" / "dist"
@@ -168,6 +170,84 @@ def upload_video():
         "message": "Video successfully uploaded and set as active source.",
         "filename": os.path.basename(path_or_err)
     })
+
+# ==================== Alert & Notification Routes ====================
+
+@app.route('/api/alerts', methods=['GET'])
+def get_alerts():
+    """Returns recent alert notifications."""
+    limit = request.args.get('limit', default=20, type=int)
+    return jsonify({
+        "success": True,
+        "alerts": alert_service.get_recent_alerts(limit=limit)
+    })
+
+@app.route('/api/alerts/<alert_id>/ack', methods=['POST'])
+@require_auth(roles=["ADMIN", "OPERATOR"])
+def acknowledge_alert(alert_id):
+    """Operator acknowledgement of an incident alert."""
+    user = getattr(g, "user", {})
+    operator_name = user.get("sub", "officer")
+    success = alert_service.acknowledge_alert(alert_id, operator_name)
+    if success:
+        security_manager.log_audit("ACKNOWLEDGE_ALERT", operator_name, user.get("role", "OPERATOR"), {
+            "alert_id": alert_id
+        })
+        return jsonify({"success": True, "alert_id": alert_id, "status": "ACKNOWLEDGED"})
+    return jsonify({"error": "Alert ID not found"}), 404
+
+@app.route('/api/alerts/stream')
+def stream_alerts():
+    """Server-Sent Events (SSE) pipe pushing real-time alerts to the browser."""
+    client_q = alert_service.register_client()
+
+    def event_stream():
+        try:
+            # Send initial ping
+            yield "data: {\"event\": \"CONNECTED\"}\n\n"
+            while True:
+                msg = client_q.get()
+                yield msg
+        except GeneratorExit:
+            alert_service.unregister_client(client_q)
+
+    return Response(event_stream(), mimetype="text/event-stream")
+
+@app.route('/api/evidence/<evidence_id>/challan', methods=['GET'])
+def generate_echallan(evidence_id):
+    """Generates official verifiable E-Challan violation ticket."""
+    violations = db_manager.get_recent_violations(limit=100)
+    target = None
+    for v in violations:
+        if v.get("evidence_id") == evidence_id or v.get("sha256_hash", "").startswith(evidence_id):
+            target = v
+            break
+
+    if not target:
+        return jsonify({"error": "Evidence record not found"}), 404
+
+    fine_amounts = {
+        "Red Light Jump": 1000,
+        "Wrong-Way Driving": 2000,
+        "Overspeeding": 1500
+    }
+    fine = fine_amounts.get(target.get("violation_type"), 1000)
+
+    challan = {
+        "challan_number": f"ECH-{target.get('evidence_id', '0000')[4:]}-{datetime.utcnow().year}",
+        "evidence_id": target.get("evidence_id"),
+        "offense": target.get("violation_type"),
+        "fine_amount_inr": fine,
+        "vehicle_class": target.get("vehicle_class"),
+        "registration_plate": target.get("license_plate", "UNKNOWN"),
+        "recorded_speed_kmh": target.get("speed_kmh") or target.get("speed"),
+        "timestamp_utc": target.get("timestamp"),
+        "chain_of_custody_hash": target.get("sha256_hash"),
+        "court_admissible": True,
+        "review_status": target.get("status", "PENDING_REVIEW"),
+        "issuing_authority": "Traffic Enforcement Department (AI Vision Division)"
+    }
+    return jsonify(challan)
 
 # ==================== Core Status & Analytics API ====================
 

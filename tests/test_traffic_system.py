@@ -106,5 +106,35 @@ class TestAITrafficSystem(unittest.TestCase):
         self.assertIsNotNone(res)
         self.assertTrue(len(db_manager.local_violations) > 0)
 
+    def test_09_alert_service_and_deduplication(self):
+        """Test alert creation, deduplication, and operator acknowledgement."""
+        from alert_service import alert_service
+        alert = alert_service.trigger_alert(
+            alert_type="TRAFFIC_VIOLATION",
+            severity="CRITICAL",
+            title="Red Light Jump Detected (#55)",
+            details={"vehicle_id": 55, "type": "Red Light Jump"}
+        )
+        self.assertIsNotNone(alert)
+        self.assertTrue(alert["alert_id"].startswith("ALT-"))
+        self.assertEqual(alert["status"], "QUEUED")
+
+        # Test operator acknowledgement
+        ack_ok = alert_service.acknowledge_alert(alert["alert_id"], "officer_sharma")
+        self.assertTrue(ack_ok)
+        self.assertEqual(alert["status"], "ACKNOWLEDGED")
+        self.assertEqual(alert["acknowledged_by"], "officer_sharma")
+
+    def test_10_echallan_generation(self):
+        """Test legal E-Challan format and fine calculation."""
+        from app import app
+        with app.test_client() as client:
+            res = client.get("/api/evidence/TEST-01/challan")
+            self.assertEqual(res.status_code, 200)
+            data = res.get_json()
+            self.assertTrue(data["challan_number"].startswith("ECH-"))
+            self.assertEqual(data["fine_amount_inr"], 1500)
+            self.assertTrue(data["court_admissible"])
+
 if __name__ == "__main__":
     unittest.main()

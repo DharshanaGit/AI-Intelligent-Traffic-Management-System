@@ -16,14 +16,17 @@ import { Doughnut, Line, Bar } from 'react-chartjs-2';
 import { 
   Activity, 
   AlertTriangle, 
+  Bell,
   Car, 
   CheckCircle, 
   Database, 
   Eye, 
+  FileText,
   Gauge, 
   Lock, 
   LogIn, 
   LogOut, 
+  Printer,
   RefreshCw, 
   ShieldAlert, 
   ShieldCheck, 
@@ -60,6 +63,12 @@ export default function App() {
   const [token, setToken] = useState(localStorage.getItem('traffic_jwt') || '');
   const [uploadStatus, setUploadStatus] = useState('');
   
+  // Real-Time Alert & Notification States
+  const [alerts, setAlerts] = useState([]);
+  const [activeToast, setActiveToast] = useState(null);
+  const [challanData, setChallanData] = useState(null);
+  const [showAlertsDrawer, setShowAlertsDrawer] = useState(false);
+  
   // Login form state
   const [loginUser, setLoginUser] = useState('operator');
   const [loginPass, setLoginPass] = useState('op123');
@@ -70,6 +79,22 @@ export default function App() {
   const getHeaders = () => {
     return token ? { 'Authorization': `Bearer ${token}` } : {};
   };
+
+  // SSE Live Alert Subscription
+  useEffect(() => {
+    const sse = new EventSource(`${API_BASE}/api/alerts/stream`);
+    sse.onmessage = (event) => {
+      try {
+        const newAlert = JSON.parse(event.data);
+        if (newAlert.alert_id) {
+          setAlerts(prev => [newAlert, ...prev.slice(0, 19)]);
+          setActiveToast(newAlert);
+          setTimeout(() => setActiveToast(null), 5000);
+        }
+      } catch (e) {}
+    };
+    return () => sse.close();
+  }, []);
 
   const fetchDashboardData = async () => {
     try {
@@ -95,6 +120,34 @@ export default function App() {
     const interval = setInterval(fetchDashboardData, 1500);
     return () => clearInterval(interval);
   }, [token]);
+
+  const handleAcknowledgeAlert = async (alertId) => {
+    try {
+      const res = await fetch(`${API_BASE}/api/alerts/${alertId}/ack`, {
+        method: 'POST',
+        headers: getHeaders()
+      });
+      if (res.ok) {
+        setAlerts(prev => prev.map(a => a.alert_id === alertId ? { ...a, status: 'ACKNOWLEDGED' } : a));
+      } else {
+        const err = await res.json();
+        alert(err.error || 'Login required to acknowledge alerts.');
+      }
+    } catch (e) {
+      console.error(e);
+    }
+  };
+
+  const handleFetchChallan = async (evidenceId) => {
+    try {
+      const res = await fetch(`${API_BASE}/api/evidence/${evidenceId}/challan`);
+      if (res.ok) {
+        setChallanData(await res.json());
+      }
+    } catch (e) {
+      console.error(e);
+    }
+  };
 
   const handleLogin = async (e) => {
     e.preventDefault();
@@ -285,6 +338,21 @@ export default function App() {
             <Database size={14} />
             <span>{status?.database?.type || 'Local Spool Active'}</span>
           </div>
+
+          {/* Real-time Alerts Bell Trigger */}
+          <button 
+            className="btn-ctrl" 
+            style={{ 
+              background: alerts.some(a => a.status !== 'ACKNOWLEDGED') ? 'rgba(239, 68, 68, 0.25)' : 'rgba(255, 255, 255, 0.08)',
+              border: alerts.some(a => a.status !== 'ACKNOWLEDGED') ? '1px solid #ef4444' : '1px solid transparent',
+              padding: '6px 12px', 
+              fontSize: '0.78rem' 
+            }}
+            onClick={() => setShowAlertsDrawer(!showAlertsDrawer)}
+          >
+            <Bell size={13} color={alerts.some(a => a.status !== 'ACKNOWLEDGED') ? '#f87171' : '#fff'} />
+            <span>Alerts ({alerts.filter(a => a.status !== 'ACKNOWLEDGED').length})</span>
+          </button>
 
           {/* User Auth Info */}
           {user.role !== 'GUEST' ? (
@@ -676,14 +744,21 @@ export default function App() {
               </div>
             </div>
 
-            <div style={{ marginTop: '18px', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-              <div style={{ display: 'flex', gap: '8px' }}>
+            <div style={{ marginTop: '18px', display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '8px' }}>
+              <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
                 <button 
                   className="btn-ctrl" 
                   style={{ background: '#10b981' }}
                   onClick={() => handleReviewViolation(activeEvidence.evidence_id || activeEvidence._id, 'VERIFIED')}
                 >
                   <CheckCircle size={14} /> Approve & Issue E-Challan
+                </button>
+                <button 
+                  className="btn-ctrl" 
+                  style={{ background: '#3b82f6' }}
+                  onClick={() => handleFetchChallan(activeEvidence.evidence_id || activeEvidence._id)}
+                >
+                  <FileText size={14} /> View Court Ticket
                 </button>
                 <button 
                   className="btn-ctrl" 
@@ -700,6 +775,155 @@ export default function App() {
               >
                 Close
               </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Official Court-Admissible E-Challan Modal */}
+      {challanData && (
+        <div className="modal-overlay" onClick={() => setChallanData(null)}>
+          <div className="modal-content" onClick={(e) => e.stopPropagation()} style={{ maxWidth: '520px', background: '#0f172a', border: '1px solid #38bdf8' }}>
+            <div style={{ borderBottom: '1px solid rgba(255,255,255,0.1)', paddingBottom: '12px', marginBottom: '14px', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+              <div>
+                <h3 style={{ fontSize: '1.2rem', color: '#38bdf8', fontWeight: 700 }}>GOVERNMENT TRAFFIC E-CHALLAN</h3>
+                <p style={{ fontSize: '0.75rem', color: '#94a3b8' }}>Certified Electronic Motor Vehicle Offense Notice</p>
+              </div>
+              <span className="badge-tag badge-red">LEGAL NOTICE</span>
+            </div>
+
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px', fontSize: '0.85rem' }}>
+              <div>
+                <span style={{ color: '#94a3b8' }}>Challan No:</span>
+                <div className="mono" style={{ fontWeight: 700, color: '#fff' }}>{challanData.challan_number}</div>
+              </div>
+              <div>
+                <span style={{ color: '#94a3b8' }}>Registration Plate:</span>
+                <div className="mono" style={{ fontWeight: 700, color: '#fbbf24', fontSize: '1rem' }}>{challanData.registration_plate}</div>
+              </div>
+              <div>
+                <span style={{ color: '#94a3b8' }}>Offense Detected:</span>
+                <div style={{ fontWeight: 600, color: '#f87171' }}>{challanData.offense}</div>
+              </div>
+              <div>
+                <span style={{ color: '#94a3b8' }}>Fine Amount:</span>
+                <div className="mono" style={{ fontWeight: 700, color: '#34d399', fontSize: '1.1rem' }}>INR {challanData.fine_amount_inr}</div>
+              </div>
+              <div>
+                <span style={{ color: '#94a3b8' }}>Vehicle Classification:</span>
+                <div>{challanData.vehicle_class}</div>
+              </div>
+              <div>
+                <span style={{ color: '#94a3b8' }}>Recorded Velocity:</span>
+                <div className="mono">{challanData.recorded_speed_kmh ? `${Math.round(challanData.recorded_speed_kmh)} km/h` : 'Stop-Line Violation'}</div>
+              </div>
+              <div style={{ gridColumn: 'span 2' }}>
+                <span style={{ color: '#94a3b8' }}>Cryptographic Hash Seal (Section 65B Certified):</span>
+                <div className="mono" style={{ fontSize: '0.68rem', color: '#67e8f9', wordBreak: 'break-all', background: 'rgba(0,0,0,0.4)', padding: '6px', borderRadius: '4px' }}>
+                  {challanData.chain_of_custody_hash}
+                </div>
+              </div>
+            </div>
+
+            <div style={{ marginTop: '18px', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+              <button 
+                className="btn-ctrl" 
+                style={{ background: '#2563eb' }}
+                onClick={() => window.print()}
+              >
+                <Printer size={14} /> Print Notice
+              </button>
+              <button 
+                className="btn-ctrl" 
+                style={{ background: '#475569' }}
+                onClick={() => setChallanData(null)}
+              >
+                Close Ticket
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Real-time Alerts Drawer */}
+      {showAlertsDrawer && (
+        <div className="modal-overlay" onClick={() => setShowAlertsDrawer(false)}>
+          <div className="modal-content" onClick={(e) => e.stopPropagation()} style={{ maxWidth: '600px', maxHeight: '80vh', overflowY: 'auto' }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '14px' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                <Bell size={18} color="#f87171" />
+                <h3 style={{ fontSize: '1.1rem', fontWeight: 600 }}>Active Incident & Congestion Alerts</h3>
+              </div>
+              <button 
+                onClick={() => setShowAlertsDrawer(false)}
+                style={{ background: 'none', border: 'none', color: '#fff', fontSize: '1.2rem', cursor: 'pointer' }}
+              >
+                ✕
+              </button>
+            </div>
+
+            {alerts.length === 0 ? (
+              <p style={{ color: '#64748b', textAlign: 'center', padding: '24px' }}>No active incident alerts registered.</p>
+            ) : (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
+                {alerts.map((a) => (
+                  <div key={a.alert_id} style={{
+                    background: a.status === 'ACKNOWLEDGED' ? 'rgba(255,255,255,0.02)' : 'rgba(239, 68, 68, 0.12)',
+                    border: a.status === 'ACKNOWLEDGED' ? '1px solid rgba(255,255,255,0.06)' : '1px solid rgba(239, 68, 68, 0.35)',
+                    borderRadius: '8px',
+                    padding: '12px'
+                  }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                      <span className={`badge-tag ${a.severity === 'CRITICAL' ? 'badge-red' : 'badge-yellow'}`}>
+                        {a.severity}
+                      </span>
+                      <span className="mono" style={{ fontSize: '0.74rem', color: '#9ca3af' }}>
+                        {new Date(a.timestamp).toLocaleTimeString()}
+                      </span>
+                    </div>
+                    <h4 style={{ fontSize: '0.92rem', marginTop: '6px', color: '#fff' }}>{a.title}</h4>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: '8px' }}>
+                      <span className="mono" style={{ fontSize: '0.74rem', color: '#94a3b8' }}>
+                        ID: {a.alert_id} | Status: {a.status}
+                      </span>
+                      {a.status !== 'ACKNOWLEDGED' && (
+                        <button 
+                          className="btn-ctrl" 
+                          style={{ background: '#3b82f6', padding: '4px 10px', fontSize: '0.74rem' }}
+                          onClick={() => handleAcknowledgeAlert(a.alert_id)}
+                        >
+                          <CheckCircle size={12} /> Acknowledge
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* Floating Real-Time Incident Toast Notification */}
+      {activeToast && (
+        <div style={{
+          position: 'fixed',
+          top: '24px',
+          right: '24px',
+          background: '#1e1b4b',
+          border: '1px solid #818cf8',
+          borderRadius: '12px',
+          padding: '14px 18px',
+          boxShadow: '0 10px 30px rgba(0,0,0,0.6)',
+          zIndex: 9999,
+          maxWidth: '360px',
+          animation: 'slideIn 0.3s ease-out'
+        }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+            <AlertTriangle size={20} color="#f87171" />
+            <div>
+              <div style={{ fontWeight: 700, fontSize: '0.9rem', color: '#fff' }}>{activeToast.title}</div>
+              <div style={{ fontSize: '0.75rem', color: '#cbd5e1' }}>Plate: {activeToast.details?.license_plate || 'In Review'}</div>
             </div>
           </div>
         </div>

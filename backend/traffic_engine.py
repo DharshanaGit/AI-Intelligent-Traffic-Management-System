@@ -8,6 +8,7 @@ from calibration_engine import calibration_engine
 from anpr_evidence import anpr_evidence_manager
 from signal_decision_support import signal_decision_support
 from db_client import db_manager
+from alert_service import alert_service
 
 # Target vehicle classes from standard COCO
 TARGET_VEHICLE_CLASSES = {
@@ -237,6 +238,21 @@ class TrafficEngine:
         )
         db_manager.log_violation(evidence_record)
         print(f"[EVIDENCE STORED] #{evidence_record['evidence_id']} - {vtype} by {vclass} (Plate: {evidence_record['license_plate']})")
+
+        # Trigger real-time alert dispatch
+        alert_service.trigger_alert(
+            alert_type="TRAFFIC_VIOLATION",
+            severity="CRITICAL" if vtype == "Red Light Jump" else "WARNING",
+            title=f"{vtype} - {vclass} (#{vid})",
+            details={
+                "evidence_id": evidence_record["evidence_id"],
+                "vehicle_id": vid,
+                "vehicle_class": vclass,
+                "license_plate": evidence_record["license_plate"],
+                "speed_kmh": speed,
+                "violation_type": vtype
+            }
+        )
 
     def annotate_frame(self, frame: np.ndarray, meta: Dict[str, Any]) -> np.ndarray:
         """Annotates frame with source health banner, calibration zones, vehicle tracking and signal HUD."""
