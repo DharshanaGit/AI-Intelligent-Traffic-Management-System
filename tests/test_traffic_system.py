@@ -215,5 +215,72 @@ class TestAITrafficSystem(unittest.TestCase):
             self.assertIn("token", data)
             self.assertEqual(data["user"]["email"], DEFAULT_EMAIL.lower().strip())
 
+    def test_14_video_control_and_cameras(self):
+        """Test video stream pause/resume/reconnect controls and camera management API."""
+        from app import app
+        from auth_security import security_manager
+        token = security_manager.generate_token("admin@traffic.gov.in", "ADMIN", "Administrator")
+        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+
+        with app.test_client() as client:
+            # Video control: pause
+            res = client.post("/api/video/control", headers=headers, json={"action": "pause"})
+            self.assertEqual(res.status_code, 200)
+            self.assertEqual(res.get_json()["status"], "PAUSED")
+
+            # Video control: resume
+            res = client.post("/api/video/control", headers=headers, json={"action": "resume"})
+            self.assertEqual(res.status_code, 200)
+            self.assertEqual(res.get_json()["status"], "PLAYING")
+
+            # Get cameras list
+            res_cams = client.get("/api/cameras")
+            self.assertEqual(res_cams.status_code, 200)
+            cams = res_cams.get_json()["cameras"]
+            self.assertGreaterEqual(len(cams), 1)
+
+            # Register new camera
+            new_cam_resp = client.post("/api/cameras", headers=headers, json={
+                "name": "East Junction Unit",
+                "location": "Corridor 4",
+                "mode": "UPLOAD",
+                "source": "backend/uploads/sample_traffic.mp4"
+            })
+            self.assertEqual(new_cam_resp.status_code, 201)
+            new_cam = new_cam_resp.get_json()["camera"]
+            self.assertTrue(new_cam["id"].startswith("CAM-"))
+
+            # Activate camera
+            act_resp = client.post(f"/api/cameras/{new_cam['id']}/activate", headers=headers)
+            self.assertEqual(act_resp.status_code, 200)
+
+            # Delete camera
+            del_resp = client.delete(f"/api/cameras/{new_cam['id']}", headers=headers)
+            self.assertEqual(del_resp.status_code, 200)
+            self.assertTrue(del_resp.get_json()["success"])
+
+    def test_15_system_health_and_audit(self):
+        """Test detailed subsystem health diagnostics and audit trail log retrieval."""
+        from app import app
+        from auth_security import security_manager
+        token = security_manager.generate_token("auditor@traffic.gov.in", "AUDITOR", "Auditor")
+        headers = {"Authorization": f"Bearer {token}"}
+
+        with app.test_client() as client:
+            # System Health
+            h_resp = client.get("/api/system/health")
+            self.assertEqual(h_resp.status_code, 200)
+            h_data = h_resp.get_json()
+            self.assertEqual(h_data["status"], "HEALTHY")
+            self.assertIn("ai_model", h_data)
+            self.assertIn("video_pipeline", h_data)
+
+            # Audit Logs
+            audit_resp = client.get("/api/system/audit-logs", headers=headers)
+            self.assertEqual(audit_resp.status_code, 200)
+            audit_data = audit_resp.get_json()
+            self.assertTrue(audit_data["success"])
+            self.assertIsInstance(audit_data["logs"], list)
+
 if __name__ == "__main__":
     unittest.main()

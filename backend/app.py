@@ -16,6 +16,7 @@ from auth_security import (
 )
 from alert_service import alert_service
 import hashlib
+import json
 
 FRONTEND_DIST = BASE_DIR / "frontend" / "dist"
 UPLOADS_DIR = BASE_DIR / "backend" / "uploads"
@@ -25,7 +26,7 @@ app = Flask(__name__, static_folder=str(STATIC_DIR))
 CORS(app, resources={r"/*": {"origins": "*"}})
 
 def generate_video_stream(is_authenticated: bool):
-    """Generator for MJPEG stream with session gating."""
+    """Generator for MJPEG stream with session gating and hot frame cache."""
     import time
     while True:
         try:
@@ -34,9 +35,10 @@ def generate_video_stream(is_authenticated: bool):
                    b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
             if not is_authenticated:
                 time.sleep(0.4)
+            else:
+                time.sleep(0.035)
         except Exception as e:
-            print(f"[STREAM ERROR] Exception in generator: {e}")
-            break
+            time.sleep(0.1)
 
 # ==================== Frontend Routes ====================
 
@@ -209,6 +211,60 @@ def upload_video():
         "message": "Video successfully uploaded and set as active source.",
         "filename": os.path.basename(path_or_err)
     })
+
+@app.route('/api/video/control', methods=['POST'])
+@require_auth(roles=["ADMIN", "OPERATOR"])
+def control_video():
+    """Manages stream playback: play, pause, resume, stop, reconnect."""
+    data = request.get_json(silent=True) or {}
+    action = data.get("action", "")
+    result = traffic_engine.control_stream(action)
+    user = getattr(g, "user", {})
+    security_manager.log_audit("VIDEO_STREAM_CONTROL", user.get("sub", "officer"), user.get("role", "OPERATOR"), {
+        "action": action,
+        "result": result
+    })
+    if result.get("success"):
+        return jsonify(result)
+    return jsonify(result), 400
+
+# ==================== Camera Management Routes ====================
+
+@app.route('/api/cameras', methods=['GET'])
+def get_cameras():
+    """Returns list of registered traffic cameras."""
+    return jsonify({
+        "success": True,
+        "cameras": video_source_manager.get_cameras()
+    })
+
+@app.route('/api/cameras', methods=['POST'])
+@require_auth(roles=["ADMIN", "OPERATOR"])
+def add_camera():
+    """Registers a new camera."""
+    data = request.get_json(silent=True) or {}
+    res = video_source_manager.add_camera(data)
+    user = getattr(g, "user", {})
+    security_manager.log_audit("REGISTER_CAMERA", user.get("sub", "officer"), user.get("role", "OPERATOR"), data)
+    return jsonify(res), 201
+
+@app.route('/api/cameras/<cam_id>', methods=['DELETE'])
+@require_auth(roles=["ADMIN"])
+def delete_camera(cam_id):
+    """Removes a camera."""
+    ok = video_source_manager.remove_camera(cam_id)
+    user = getattr(g, "user", {})
+    security_manager.log_audit("DELETE_CAMERA", user.get("sub", "admin"), user.get("role", "ADMIN"), {"cam_id": cam_id})
+    return jsonify({"success": ok})
+
+@app.route('/api/cameras/<cam_id>/activate', methods=['POST'])
+@require_auth(roles=["ADMIN", "OPERATOR"])
+def activate_camera(cam_id):
+    """Switches active video feed to selected camera."""
+    res = video_source_manager.activate_camera(cam_id)
+    user = getattr(g, "user", {})
+    security_manager.log_audit("ACTIVATE_CAMERA", user.get("sub", "officer"), user.get("role", "OPERATOR"), {"cam_id": cam_id, "result": res})
+    return jsonify(res)
 
 # ==================== Alert & Notification Routes ====================
 
@@ -410,6 +466,62 @@ def serve_violation_snapshot(filename):
     """Serves cropped violation snapshots with path traversal protection."""
     safe_name = os.path.basename(filename)
     return send_from_directory(str(VIOLATIONS_DIR), safe_name)
+
+# ==================== System Audit & Health Telemetry ====================
+
+@app.route('/api/system/audit-logs', methods=['GET'])
+@require_auth(roles=["ADMIN", "AUDITOR"])
+def get_audit_logs():
+    """Returns cryptographically signed immutable security audit events."""
+    logs = []
+    log_path = BASE_DIR / "backend" / "audit_trail.log"
+    if log_path.exists():
+        try:
+            with open(str(log_path), "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        try:
+                            logs.append(json.loads(line))
+                        except Exception:
+                            pass
+        except Exception as e:
+            print(f"[AUDIT LOG READ ERROR]: {e}")
+    return jsonify({
+        "success": True,
+        "count": len(logs),
+        "logs": logs[-60:][::-1]
+    })
+
+@app.route('/api/system/health', methods=['GET'])
+def get_system_health():
+    """Returns detailed real-time health diagnostics across all subsystems."""
+    status = traffic_engine.get_status()
+    return jsonify({
+        "status": "HEALTHY",
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "ai_model": {
+            "name": "YOLOv5n ONNX (OpenCV DNN C++)",
+            "inference_target": "CPU Native",
+            "measured_fps": status["traffic"]["fps"],
+            "latency_ms": status["traffic"]["latency_ms"],
+            "status": "OPERATIONAL" if not traffic_engine.is_stopped else "STOPPED"
+        },
+        "video_pipeline": {
+            "mode": status["source"]["mode"],
+            "source": status["source"]["source_path"],
+            "health": status["source"]["health"],
+            "is_paused": status["source"]["is_paused"],
+            "is_stopped": status["source"]["is_stopped"],
+            "last_frame_processed": status["source"]["last_processed"]
+        },
+        "adaptive_signal": {
+            "current_phase": status["signal"]["current_phase"],
+            "safety_guard": status["signal"]["safety_interlock"],
+            "advisory_only": status["signal"]["advisory_only"]
+        },
+        "database": status["database"]
+    })
 
 if __name__ == '__main__':
     print(f"==================================================")

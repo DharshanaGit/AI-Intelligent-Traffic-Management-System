@@ -4,7 +4,7 @@ import time
 import os
 import threading
 from datetime import datetime
-from typing import Optional, Tuple, Dict, Any
+from typing import Optional, Tuple, Dict, Any, List
 from pathlib import Path
 from werkzeug.utils import secure_filename
 from config import BASE_DIR
@@ -40,6 +40,40 @@ class VideoSourceManager:
         # Procedural simulation generator
         self.sim_vehicles = []
         self._init_simulation_state()
+
+        # Camera Registry for Multi-Camera Management
+        self.cameras = [
+            {
+                "id": "CAM-01",
+                "name": "Junction North Approach (Sample Video)",
+                "location": "MG Road & Ring Road Junction",
+                "mode": "UPLOAD",
+                "source": str(BASE_DIR / "backend" / "uploads" / "sample_traffic.mp4"),
+                "status": "ONLINE",
+                "resolution": "640x480",
+                "is_active": True
+            },
+            {
+                "id": "CAM-02",
+                "name": "Control Station USB Sensor (#0)",
+                "location": "Traffic Lab Surveillance Rig",
+                "mode": "WEBCAM",
+                "source": "0",
+                "status": "STANDBY",
+                "resolution": "640x480",
+                "is_active": False
+            },
+            {
+                "id": "CAM-03",
+                "name": "Synthetic Multi-Lane Grid",
+                "location": "Virtual Procedural Sandbox",
+                "mode": "SIMULATION",
+                "source": "",
+                "status": "ONLINE",
+                "resolution": "640x480",
+                "is_active": False
+            }
+        ]
         
         # Set default to sample uploaded traffic if available, else simulation
         sample_path = BASE_DIR / "backend" / "uploads" / "sample_traffic.mp4"
@@ -148,6 +182,50 @@ class VideoSourceManager:
 
         return {"success": False, "error": "Unknown configuration."}
 
+    def reconnect(self) -> Dict[str, Any]:
+        """Reconnects current active video source."""
+        return self.set_source(self.mode, self.source_path)
+
+    def get_cameras(self) -> List[Dict[str, Any]]:
+        """Returns registered camera inventory with live status."""
+        for cam in self.cameras:
+            if cam["mode"] == self.mode and (cam["source"] == self.source_path or cam["mode"] == "SIMULATION"):
+                cam["is_active"] = True
+                cam["status"] = self.health_status
+            else:
+                cam["is_active"] = False
+        return self.cameras
+
+    def add_camera(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """Registers a new camera endpoint."""
+        cam_id = f"CAM-0{len(self.cameras) + 1}"
+        new_cam = {
+            "id": cam_id,
+            "name": data.get("name", f"Camera {cam_id}"),
+            "location": data.get("location", "Urban Node"),
+            "mode": data.get("mode", "RTSP").upper(),
+            "source": data.get("source", ""),
+            "status": "REGISTERED",
+            "resolution": "640x480",
+            "is_active": False
+        }
+        self.cameras.append(new_cam)
+        return {"success": True, "camera": new_cam}
+
+    def remove_camera(self, cam_id: str) -> bool:
+        """Removes camera by ID."""
+        orig_len = len(self.cameras)
+        self.cameras = [c for c in self.cameras if c["id"] != cam_id]
+        return len(self.cameras) < orig_len
+
+    def activate_camera(self, cam_id: str) -> Dict[str, Any]:
+        """Activates a camera as the primary video source."""
+        for cam in self.cameras:
+            if cam["id"] == cam_id:
+                res = self.set_source(cam["mode"], cam["source"])
+                return res
+        return {"success": False, "error": f"Camera {cam_id} not found."}
+
     def read_frame(self, is_authenticated: bool = True) -> Tuple[np.ndarray, Dict[str, Any]]:
         """Reads next frame and performs stream health analysis."""
         with self.lock:
@@ -180,6 +258,12 @@ class VideoSourceManager:
                 if self.mode == "UPLOAD" and self.cap is not None:
                     self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
                     ret, raw_frame = self.cap.read()
+                    if not ret or raw_frame is None:
+                        try:
+                            self.cap.open(self.source_path)
+                            ret, raw_frame = self.cap.read()
+                        except Exception:
+                            pass
 
                 if not ret or raw_frame is None:
                     self.health_status = "DISCONNECTED"

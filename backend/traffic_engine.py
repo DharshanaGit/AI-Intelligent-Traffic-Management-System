@@ -1,7 +1,9 @@
 import cv2
 import numpy as np
 import time
+import threading
 from typing import Dict, List, Tuple, Any, Optional
+from datetime import datetime
 from config import MODEL_PATH
 from video_manager import video_source_manager
 from calibration_engine import calibration_engine
@@ -55,15 +57,32 @@ class TrafficEngine:
         self.last_fps_time = time.time()
         self.fps_frame_counter = 0
 
+        # Continuous Pipeline State & Worker
+        self.is_paused = False
+        self.is_stopped = False
+        self.latency_ms = 35.0
+        self.last_frame_processed_time = datetime.utcnow().isoformat() + "Z"
+        self.queue_estimates = {"north": 0, "south": 0, "east": 0, "west": 0}
+        self.latest_frame_jpeg: bytes = b""
+        self.latest_raw_frame = None
+        self.latest_meta: Dict[str, Any] = {}
+        self.lock = threading.Lock()
+        self.net_lock = threading.Lock()
+
+        # Start continuous background AI ingestion worker
+        self.worker_thread = threading.Thread(target=self._background_pipeline_worker, daemon=True)
+        self.worker_thread.start()
+
     def run_detection(self, frame: np.ndarray):
         """Runs YOLOv5n ONNX inference on 640x480 frame."""
         self.frame_index += 1
         h, w = frame.shape[:2]
 
         if self.frame_index % (self.skip_frames + 1) == 0 or len(self.cached_boxes) == 0:
-            blob = cv2.dnn.blobFromImage(frame, 1/255.0, (640, 640), swapRB=True, crop=False)
-            self.net.setInput(blob)
-            outputs = self.net.forward()[0]
+            with self.net_lock:
+                blob = cv2.dnn.blobFromImage(frame, 1/255.0, (640, 640), swapRB=True, crop=False)
+                self.net.setInput(blob)
+                outputs = self.net.forward()[0]
 
             boxes = []
             confidences = []
@@ -317,34 +336,112 @@ class TrafficEngine:
 
         return out
 
+    def _calculate_queue_estimates(self):
+        """Estimates queue lengths per intersection approach based on spatial centroids."""
+        north, south, east, west = 0, 0, 0, 0
+        for vid, v in self.tracked_vehicles.items():
+            cx, cy = v["centroid"]
+            speed = v.get("speed", 0.0)
+            if speed < 25.0:
+                if cy < 240 and cx < 320:
+                    north += 1
+                elif cy >= 240 and cx < 320:
+                    south += 1
+                elif cy < 240 and cx >= 320:
+                    east += 1
+                else:
+                    west += 1
+            else:
+                if cy < 240:
+                    north += 1
+                else:
+                    south += 1
+        self.queue_estimates = {"north": north, "south": south, "east": east, "west": west}
+
+    def control_stream(self, action: str) -> Dict[str, Any]:
+        """Manages video stream state: play, pause, resume, stop, reconnect."""
+        act = action.lower().strip()
+        if act == "pause":
+            self.is_paused = True
+            return {"success": True, "action": "pause", "status": "PAUSED"}
+        elif act in ("resume", "play"):
+            self.is_paused = False
+            self.is_stopped = False
+            return {"success": True, "action": "play", "status": "PLAYING"}
+        elif act == "stop":
+            self.is_stopped = True
+            return {"success": True, "action": "stop", "status": "STOPPED"}
+        elif act == "reconnect":
+            self.is_stopped = False
+            self.is_paused = False
+            res = video_source_manager.reconnect()
+            return {"success": True, "action": "reconnect", "result": res}
+        return {"success": False, "error": f"Unknown control action: {action}"}
+
+    def _background_pipeline_worker(self):
+        """Continuous pipeline loop ensuring instant frame availability and uninterrupted telemetry."""
+        while True:
+            try:
+                if self.is_stopped:
+                    stopped_frame = np.full((480, 640, 3), 20, dtype=np.uint8)
+                    cv2.putText(stopped_frame, "STREAM INGESTION STOPPED", (140, 240),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 200), 2)
+                    ret, buffer = cv2.imencode('.jpg', stopped_frame, [int(cv2.IMWRITE_JPEG_QUALITY), 75])
+                    if ret:
+                        with self.lock:
+                            self.latest_frame_jpeg = buffer.tobytes()
+                    time.sleep(0.2)
+                    continue
+
+                if self.is_paused:
+                    time.sleep(0.1)
+                    continue
+
+                t0 = time.time()
+                raw_frame, meta = video_source_manager.read_frame(is_authenticated=True)
+                if raw_frame is not None:
+                    boxes, confs, classes = self.run_detection(raw_frame)
+                    self.update_tracking(raw_frame, boxes, classes)
+                    self._calculate_queue_estimates()
+                    signal_decision_support.update_state(len(self.tracked_vehicles), self.vehicle_counts)
+                    annotated = self.annotate_frame(raw_frame, meta)
+
+                    ret, buffer = cv2.imencode('.jpg', annotated, [int(cv2.IMWRITE_JPEG_QUALITY), 75])
+                    if ret:
+                        with self.lock:
+                            self.latest_frame_jpeg = buffer.tobytes()
+                            self.latest_raw_frame = raw_frame
+                            self.latest_meta = meta
+                            self.last_frame_processed_time = datetime.utcnow().isoformat() + "Z"
+                            self.latency_ms = round((time.time() - t0) * 1000.0, 1)
+
+                    if self.frame_index % 30 == 0:
+                        db_manager.log_telemetry({
+                            "active_vehicles": len(self.tracked_vehicles),
+                            "vehicle_counts": self.vehicle_counts,
+                            "congestion_pcu": signal_decision_support.compute_lane_pcu(self.vehicle_counts),
+                            "signal_phase": signal_decision_support.current_phase,
+                            "stream_health": meta.get("health", "HEALTHY"),
+                            "fps": self.current_fps,
+                            "latency_ms": self.latency_ms
+                        })
+
+                # Regulate to ~25 FPS to maintain smooth feed while preserving CPU
+                dt = time.time() - t0
+                if dt < 0.04:
+                    time.sleep(0.04 - dt)
+            except Exception as e:
+                time.sleep(0.05)
+
     def get_frame(self, is_authenticated: bool = True) -> bytes:
         """Main pipeline execution loop for live video streaming."""
+        with self.lock:
+            if self.latest_frame_jpeg:
+                return self.latest_frame_jpeg
+
+        # Fallback if initial background frame not yet ready
         raw_frame, meta = video_source_manager.read_frame(is_authenticated=is_authenticated)
-        
-        # When unauthenticated, stream the clean security standby visual without burning CPU on AI inference
-        if not is_authenticated:
-            ret, buffer = cv2.imencode('.jpg', raw_frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
-            return buffer.tobytes()
-
-        boxes, confs, classes = self.run_detection(raw_frame)
-        self.update_tracking(raw_frame, boxes, classes)
-        
-        # Adaptive decision support progress
-        signal_decision_support.update_state(len(self.tracked_vehicles), self.vehicle_counts)
-        annotated = self.annotate_frame(raw_frame, meta)
-
-        # Log rolling telemetry every 30 frames
-        if self.frame_index % 30 == 0:
-            db_manager.log_telemetry({
-                "active_vehicles": len(self.tracked_vehicles),
-                "vehicle_counts": self.vehicle_counts,
-                "congestion_pcu": signal_decision_support.compute_lane_pcu(self.vehicle_counts),
-                "signal_phase": signal_decision_support.current_phase,
-                "stream_health": meta.get("health", "HEALTHY"),
-                "fps": self.current_fps
-            })
-
-        ret, buffer = cv2.imencode('.jpg', annotated, [int(cv2.IMWRITE_JPEG_QUALITY), 75])
+        ret, buffer = cv2.imencode('.jpg', raw_frame, [int(cv2.IMWRITE_JPEG_QUALITY), 75])
         return buffer.tobytes()
 
     def get_status(self) -> dict:
@@ -353,8 +450,12 @@ class TrafficEngine:
             "mode": video_source_manager.mode,
             "source_path": video_source_manager.source_path,
             "health": video_source_manager.health_status,
-            "measured_fps": video_source_manager.measured_fps,
-            "is_simulation": (video_source_manager.mode == "SIMULATION")
+            "measured_fps": self.current_fps,
+            "is_simulation": (video_source_manager.mode == "SIMULATION"),
+            "is_paused": self.is_paused,
+            "is_stopped": self.is_stopped,
+            "last_processed": self.last_frame_processed_time,
+            "latency_ms": self.latency_ms
         }
         sig_status = signal_decision_support.get_status()
 
@@ -366,7 +467,10 @@ class TrafficEngine:
                 "total_counted": self.total_counted,
                 "vehicle_counts": self.vehicle_counts,
                 "current_pcu": signal_decision_support.compute_lane_pcu(self.vehicle_counts),
-                "fps": self.current_fps
+                "fps": self.current_fps,
+                "latency_ms": self.latency_ms,
+                "queue_estimates": self.queue_estimates,
+                "last_update": self.last_frame_processed_time
             },
             "calibration": {
                 "calibrated": calibration_engine.is_calibrated,
