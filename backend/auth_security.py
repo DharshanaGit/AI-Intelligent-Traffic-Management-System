@@ -3,33 +3,80 @@ import hmac
 import time
 import json
 import base64
+import secrets
+import re
 from functools import wraps
 from flask import request, jsonify, g
 from datetime import datetime
 from config import BASE_DIR
+from db_client import db_manager
 
 SECRET_KEY = "TRAFFIC_SECURE_KEY_LOCAL_DEV_2026_DO_NOT_EXPOSE"
 AUDIT_LOG_FILE = BASE_DIR / "backend" / "audit_trail.log"
 
-# Pre-defined Role Accounts for Demonstration & Security
-# Passwords hashed with SHA-256 + Salt
 USERS = {
-    "admin": {
-        "password_hash": hashlib.sha256(b"admin_traffic_2026_salt_123").hexdigest(),
-        "role": "ADMIN",
-        "name": "System Administrator"
-    },
-    "operator": {
-        "password_hash": hashlib.sha256(b"operator_2026_salt_123").hexdigest(),
-        "role": "OPERATOR",
-        "name": "Traffic Control Officer"
-    },
-    "auditor": {
-        "password_hash": hashlib.sha256(b"auditor_2026_salt_123").hexdigest(),
-        "role": "AUDITOR",
-        "name": "Compliance Inspector"
-    }
+    "admin": {"role": "ADMIN", "name": "System Administrator"},
+    "operator": {"role": "OPERATOR", "name": "Traffic Control Officer"},
+    "auditor": {"role": "AUDITOR", "name": "Independent Auditor"}
 }
+
+EMAIL_REGEX = re.compile(r'^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$')
+
+def validate_email_format(email: str) -> tuple[bool, str]:
+    """Validates that email follows standard format."""
+    if not email or not isinstance(email, str):
+        return False, "Email address is required."
+    clean = email.strip()
+    if not EMAIL_REGEX.match(clean):
+        return False, "Invalid email address format (e.g. officer@traffic.gov.in)."
+    return True, clean.lower()
+
+def validate_password_strength(password: str) -> tuple[bool, str]:
+    """
+    Enforces password strength:
+    - Minimum 8 characters
+    - Must contain at least one letter and at least one number
+    """
+    if not password or len(password) < 8:
+        return False, "Password must be at least 8 characters long."
+    if not re.search(r'[A-Za-z]', password):
+        return False, "Password must contain at least one letter."
+    if not re.search(r'[0-9]', password):
+        return False, "Password must contain at least one numeric digit."
+    return True, ""
+
+def hash_password(password: str, salt: str = None) -> tuple[str, str]:
+    """Generates PBKDF2-HMAC-SHA256 hash with cryptographic salt."""
+    if not salt:
+        salt = secrets.token_hex(16)
+    pw_hash = hashlib.pbkdf2_hmac(
+        'sha256',
+        password.encode('utf-8'),
+        salt.encode('utf-8'),
+        100000
+    ).hex()
+    return pw_hash, salt
+
+def verify_password(password: str, salt: str, expected_hash: str) -> bool:
+    """Verifies candidate password against stored salt and expected hash."""
+    pw_hash = hashlib.pbkdf2_hmac(
+        'sha256',
+        password.encode('utf-8'),
+        salt.encode('utf-8'),
+        100000
+    ).hex()
+    return hmac.compare_digest(pw_hash, expected_hash)
+
+# Seed default administrator accounts into database if empty
+def _ensure_default_accounts():
+    if not db_manager.get_user_by_email("admin@traffic.gov.in"):
+        p_hash, s = hash_password("Admin@2026")
+        db_manager.create_user("admin@traffic.gov.in", p_hash, s, "System Administrator", "ADMIN")
+    if not db_manager.get_user_by_email("officer@traffic.gov.in"):
+        p_hash, s = hash_password("Officer@2026")
+        db_manager.create_user("officer@traffic.gov.in", p_hash, s, "Traffic Control Officer", "OPERATOR")
+
+_ensure_default_accounts()
 
 class SecurityManager:
     def __init__(self):
@@ -37,12 +84,13 @@ class SecurityManager:
         self.max_requests_per_window = 120
         self.request_counts = {}  # ip -> [(timestamp, count)]
 
-    def generate_token(self, username: str, role: str) -> str:
+    def generate_token(self, email: str, role: str, name: str = "Operator") -> str:
         """Generates cryptographically signed HMAC-SHA256 session token."""
         header = base64.b64encode(json.dumps({"alg": "HS256", "typ": "JWT"}).encode()).decode()
         payload_data = {
-            "sub": username,
+            "sub": email,
             "role": role,
+            "name": name,
             "iat": int(time.time()),
             "exp": int(time.time() + 3600 * 12)  # 12 hours
         }
@@ -72,18 +120,17 @@ class SecurityManager:
         """Sliding window in-memory rate limiter."""
         now = time.time()
         requests = self.request_counts.get(client_ip, [])
-        # Filter requests within current window
         recent = [t for t in requests if now - t < self.rate_limit_window]
         recent.append(now)
         self.request_counts[client_ip] = recent
         return len(recent) <= self.max_requests_per_window
 
-    def log_audit(self, action: str, username: str, role: str, details: dict):
+    def log_audit(self, action: str, email: str, role: str, details: dict):
         """Appends immutable audit log entry for regulatory compliance."""
         entry = {
             "timestamp": datetime.utcnow().isoformat() + "Z",
             "action": action,
-            "user": username,
+            "user": email,
             "role": role,
             "ip": request.remote_addr if request else "127.0.0.1",
             "details": details
@@ -101,27 +148,26 @@ def require_auth(roles=None):
     def decorator(f):
         @wraps(f)
         def decorated(*args, **kwargs):
-            # Check rate limit
             client_ip = request.remote_addr or "127.0.0.1"
             if not security_manager.check_rate_limit(client_ip):
                 return jsonify({"error": "Too many requests. Rate limit exceeded."}), 429
 
-            # Check Authorization Header
             auth_header = request.headers.get("Authorization", "")
             token = ""
             if auth_header.startswith("Bearer "):
                 token = auth_header[7:]
+            elif request.args.get("token"):
+                token = request.args.get("token")
 
-            # If no token passed, allow guest read-only for public metrics
-            if not token and (request.method == "GET" and request.endpoint in ('video_feed', 'get_status', 'get_analytics', 'serve_frontend_assets', 'index')):
+            # Public unauthenticated endpoints
+            if not token and request.method == "GET" and request.endpoint in ('serve_frontend_assets', 'index'):
                 g.user = {"sub": "guest", "role": "GUEST"}
                 return f(*args, **kwargs)
 
-            user_data = security_manager.verify_token(token)
+            user_data = security_manager.verify_token(token) if token else None
             if not user_data:
-                # If guest accessing protected mutation endpoint
-                if roles:
-                    return jsonify({"error": "Authentication required. Invalid or expired token."}), 401
+                if roles or request.endpoint not in ('serve_frontend_assets', 'index'):
+                    return jsonify({"error": "Authentication required. Please log in or sign up."}), 401
                 g.user = {"sub": "guest", "role": "GUEST"}
                 return f(*args, **kwargs)
 

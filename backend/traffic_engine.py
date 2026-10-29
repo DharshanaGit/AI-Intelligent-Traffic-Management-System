@@ -317,9 +317,15 @@ class TrafficEngine:
 
         return out
 
-    def get_frame(self) -> bytes:
+    def get_frame(self, is_authenticated: bool = True) -> bytes:
         """Main pipeline execution loop for live video streaming."""
-        raw_frame, meta = video_source_manager.read_frame()
+        raw_frame, meta = video_source_manager.read_frame(is_authenticated=is_authenticated)
+        
+        # When unauthenticated, stream the clean security standby visual without burning CPU on AI inference
+        if not is_authenticated:
+            ret, buffer = cv2.imencode('.jpg', raw_frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+            return buffer.tobytes()
+
         boxes, confs, classes = self.run_detection(raw_frame)
         self.update_tracking(raw_frame, boxes, classes)
         

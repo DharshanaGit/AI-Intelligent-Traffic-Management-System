@@ -18,10 +18,12 @@ class DatabaseManager:
         self.violations_col = None
         self.telemetry_col = None
         self.audit_col = None
+        self.users_col = None
         
         # Local RAM & Spool buffers
         self.local_violations: List[Dict[str, Any]] = []
         self.local_telemetry: List[Dict[str, Any]] = []
+        self.local_users: Dict[str, Dict[str, Any]] = {}
         self._load_offline_spool()
         self._init_connection()
 
@@ -33,6 +35,7 @@ class DatabaseManager:
                     data = json.load(f)
                     self.local_violations = data.get("violations", [])
                     self.local_telemetry = data.get("telemetry", [])
+                    self.local_users = data.get("users", {})
             except Exception as e:
                 print(f"[DB SPOOL WARNING] Could not read existing spool file: {e}")
 
@@ -42,7 +45,8 @@ class DatabaseManager:
             with open(str(OFFLINE_SPOOL_FILE), "w", encoding="utf-8") as f:
                 json.dump({
                     "violations": self.local_violations[:200],
-                    "telemetry": self.local_telemetry[-100:]
+                    "telemetry": self.local_telemetry[-100:],
+                    "users": self.local_users
                 }, f, indent=2)
         except Exception as e:
             print(f"[DB SPOOL ERROR] Failed writing offline spool: {e}")
@@ -61,11 +65,13 @@ class DatabaseManager:
             self.violations_col = self.db["violations"]
             self.telemetry_col = self.db["traffic_telemetry"]
             self.audit_col = self.db["security_audits"]
+            self.users_col = self.db["users"]
 
             # Ensure optimal compound indices
             self.violations_col.create_index([("timestamp", DESCENDING), ("status", ASCENDING)])
             self.violations_col.create_index([("sha256_hash", ASCENDING)], unique=True)
             self.telemetry_col.create_index([("timestamp", DESCENDING)])
+            self.users_col.create_index([("email", ASCENDING)], unique=True)
 
             self.connected = True
             print(f"[SUCCESS] Connected securely to MongoDB Atlas database: {DB_NAME}")
@@ -201,7 +207,50 @@ class DatabaseManager:
             "connected": self.connected,
             "database": DB_NAME if self.connected else "local_offline_spool",
             "type": "MongoDB Atlas Cluster" if self.connected else "Offline Resilient Spool",
-            "unflushed_offline_records": unflushed_count
+            "unflushed_offline_records": unflushed_count,
+            "registered_users_count": len(self.local_users)
         }
+
+    # ==================== User Management Methods ====================
+
+    def create_user(self, email: str, password_hash: str, salt: str, name: str, role: str) -> bool:
+        """Stores a new verified user account with salt and password hash."""
+        email_clean = email.lower().strip()
+        if self.get_user_by_email(email_clean):
+            return False
+
+        user_doc = {
+            "email": email_clean,
+            "password_hash": password_hash,
+            "salt": salt,
+            "name": name.strip() if name else email_clean.split('@')[0],
+            "role": role.upper(),
+            "created_at": datetime.utcnow().isoformat() + "Z"
+        }
+
+        if self.connected and self.users_col is not None:
+            try:
+                self.users_col.insert_one(user_doc.copy())
+            except Exception as e:
+                print(f"[DB ERROR] Inserting user to Atlas: {e}")
+
+        self.local_users[email_clean] = user_doc
+        self._save_offline_spool()
+        return True
+
+    def get_user_by_email(self, email: str) -> Optional[Dict[str, Any]]:
+        """Finds user document by email address."""
+        if not email:
+            return None
+        email_clean = email.lower().strip()
+        if self.connected and self.users_col is not None:
+            try:
+                user = self.users_col.find_one({"email": email_clean})
+                if user:
+                    user["_id"] = str(user["_id"])
+                    return user
+            except Exception:
+                pass
+        return self.local_users.get(email_clean)
 
 db_manager = DatabaseManager()

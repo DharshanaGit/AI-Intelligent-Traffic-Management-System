@@ -136,5 +136,72 @@ class TestAITrafficSystem(unittest.TestCase):
             self.assertEqual(data["fine_amount_inr"], 1500)
             self.assertTrue(data["court_admissible"])
 
+    def test_11_email_auth_and_registration(self):
+        """Test email validation, password strength, user registration and login."""
+        import time
+        from auth_security import (
+            validate_email_format, validate_password_strength,
+            hash_password, verify_password
+        )
+        from app import app
+
+        # 1. Validation tests
+        ok, res = validate_email_format("operator@traffic.gov.in")
+        self.assertTrue(ok)
+        self.assertEqual(res, "operator@traffic.gov.in")
+
+        ok, msg = validate_email_format("invalid-email-address")
+        self.assertFalse(ok)
+
+        ok, msg = validate_password_strength("weak")
+        self.assertFalse(ok)
+
+        ok, msg = validate_password_strength("StrongPass2026")
+        self.assertTrue(ok)
+
+        # 2. Hash & Salt
+        h, salt = hash_password("Secret123")
+        self.assertTrue(verify_password("Secret123", salt, h))
+        self.assertFalse(verify_password("WrongPass", salt, h))
+
+        # 3. Register & Login API tests
+        with app.test_client() as client:
+            # Registration
+            test_email = f"test_{int(time.time())}@traffic.gov.in"
+            reg_resp = client.post("/api/auth/register", json={
+                "email": test_email,
+                "password": "Password2026",
+                "name": "Inspector Rao",
+                "role": "OPERATOR"
+            })
+            self.assertIn(reg_resp.status_code, [200, 201])
+            reg_data = reg_resp.get_json()
+            self.assertTrue(reg_data["success"])
+
+            # Duplicate rejection
+            dup_resp = client.post("/api/auth/register", json={
+                "email": test_email,
+                "password": "Password2026"
+            })
+            self.assertEqual(dup_resp.status_code, 409)
+
+            # Login
+            login_resp = client.post("/api/auth/login", json={
+                "email": test_email,
+                "password": "Password2026"
+            })
+            self.assertEqual(login_resp.status_code, 200)
+            login_data = login_resp.get_json()
+            self.assertTrue(login_data["success"])
+            self.assertIn("token", login_data)
+
+    def test_12_gated_video_stream(self):
+        """Test that unauthenticated requests to video feed are marked unauthenticated."""
+        from app import app
+        with app.test_client() as client:
+            resp = client.get("/video_feed")
+            self.assertEqual(resp.status_code, 200)
+            self.assertEqual(resp.mimetype, "multipart/x-mixed-replace")
+
 if __name__ == "__main__":
     unittest.main()

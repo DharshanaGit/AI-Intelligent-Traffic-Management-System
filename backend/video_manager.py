@@ -148,18 +148,24 @@ class VideoSourceManager:
 
         return {"success": False, "error": "Unknown configuration."}
 
-    def read_frame(self) -> Tuple[np.ndarray, Dict[str, Any]]:
+    def read_frame(self, is_authenticated: bool = True) -> Tuple[np.ndarray, Dict[str, Any]]:
         """Reads next frame and performs stream health analysis."""
         with self.lock:
-            frame = None
             metadata = {
                 "mode": self.mode,
                 "health": self.health_status,
                 "timestamp": datetime.utcnow().isoformat() + "Z",
                 "frame_index": self.frame_index,
                 "fps": self.measured_fps,
-                "is_simulation": (self.mode == "SIMULATION")
+                "is_simulation": (self.mode == "SIMULATION"),
+                "is_authenticated": is_authenticated
             }
+
+            # If user is not authenticated, do not burn CPU playing/processing video
+            if not is_authenticated:
+                frame = self._render_standby_frame()
+                metadata["health"] = "STANDBY"
+                return frame, metadata
 
             if self.mode == "SIMULATION" or self.cap is None:
                 frame = self._render_simulation_frame()
@@ -178,7 +184,6 @@ class VideoSourceManager:
                 if not ret or raw_frame is None:
                     self.health_status = "DISCONNECTED"
                     metadata["health"] = self.health_status
-                    # Fallback to test canvas indicating stream loss
                     frame = self._render_disconnected_fallback()
                     return frame, metadata
 
@@ -200,6 +205,19 @@ class VideoSourceManager:
             metadata["fps"] = self.measured_fps
 
             return frame, metadata
+
+    def _render_standby_frame(self) -> np.ndarray:
+        """Standby display when no operator is authenticated."""
+        frame = np.full((480, 640, 3), 15, dtype=np.uint8)
+        cv2.rectangle(frame, (50, 130), (590, 340), (24, 30, 44), -1)
+        cv2.rectangle(frame, (50, 130), (590, 340), (99, 102, 241), 2)
+        cv2.putText(frame, "OPERATIONAL STANDBY - AUTH REQUIRED", (75, 200),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2)
+        cv2.putText(frame, "Sign in or create an account to activate live AI pipeline", (80, 245),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (148, 163, 184), 1)
+        cv2.putText(frame, "AI Intelligent Traffic Management System", (140, 290),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (129, 140, 248), 1)
+        return frame
 
     def _check_frozen_health(self, frame: np.ndarray):
         """Detects if incoming video stream is stuck/frozen."""
@@ -258,7 +276,7 @@ class VideoSourceManager:
         return frame
 
 def validate_video_upload(file_storage, dest_folder: Path) -> Tuple[bool, str]:
-    """Validates uploaded video file for magic bytes, extension and size."""
+    """Validates uploaded video file for magic bytes, extension, size and OpenCV decode."""
     filename = secure_filename(file_storage.filename)
     if not filename:
         return False, "Invalid filename."
@@ -267,7 +285,6 @@ def validate_video_upload(file_storage, dest_folder: Path) -> Tuple[bool, str]:
     if ext not in ALLOWED_EXTENSIONS:
         return False, f"File extension '{ext}' not allowed. Must be MP4, AVI, or MOV."
 
-    # Save temporary file to check size and magic bytes
     dest_path = dest_folder / filename
     file_storage.save(str(dest_path))
 
@@ -276,20 +293,25 @@ def validate_video_upload(file_storage, dest_folder: Path) -> Tuple[bool, str]:
         os.remove(str(dest_path))
         return False, f"File size exceeds 100MB limit ({size // (1024*1024)}MB)."
 
-    # Check magic bytes for MP4 (ftyp) or AVI (RIFF)
-    try:
-        with open(str(dest_path), 'rb') as f:
-            header = f.read(32)
-            is_mp4 = b'ftyp' in header
-            is_avi = header.startswith(b'RIFF')
-            is_mov = b'moov' in header or b'wide' in header or is_mp4
-            if not (is_mp4 or is_avi or is_mov):
+    # Verify video decoding with OpenCV
+    test_cap = cv2.VideoCapture(str(dest_path))
+    opened = test_cap.isOpened()
+    ret, test_frame = test_cap.read() if opened else (False, None)
+    test_cap.release()
+
+    if not opened or not ret or test_frame is None:
+        # Fallback binary header check
+        try:
+            with open(str(dest_path), 'rb') as f:
+                header = f.read(256)
+                valid_magic = any(sig in header for sig in [b'ftyp', b'moov', b'mdat', b'RIFF', b'\x1aE\xdf\xa3', b'wide'])
+                if not valid_magic:
+                    os.remove(str(dest_path))
+                    return False, "Uploaded file failed video verification (unsupported codec or corrupt video)."
+        except Exception as e:
+            if dest_path.exists():
                 os.remove(str(dest_path))
-                return False, "File failed binary signature validation (not a valid video format)."
-    except Exception as e:
-        if dest_path.exists():
-            os.remove(str(dest_path))
-        return False, f"Failed verifying file signature: {e}"
+            return False, f"Error validating video file: {e}"
 
     return True, str(dest_path)
 

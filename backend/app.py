@@ -9,7 +9,11 @@ from traffic_engine import traffic_engine
 from db_client import db_manager
 from calibration_engine import calibration_engine
 from signal_decision_support import signal_decision_support
-from auth_security import security_manager, require_auth, USERS
+from auth_security import (
+    security_manager, require_auth, USERS,
+    validate_email_format, validate_password_strength,
+    hash_password, verify_password
+)
 from alert_service import alert_service
 import hashlib
 
@@ -20,13 +24,16 @@ UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
 app = Flask(__name__, static_folder=str(STATIC_DIR))
 CORS(app, resources={r"/*": {"origins": "*"}})
 
-def generate_video_stream():
-    """Generator for MJPEG stream consumed by the React UI."""
+def generate_video_stream(is_authenticated: bool):
+    """Generator for MJPEG stream with session gating."""
+    import time
     while True:
         try:
-            frame_bytes = traffic_engine.get_frame()
+            frame_bytes = traffic_engine.get_frame(is_authenticated=is_authenticated)
             yield (b'--frame\r\n'
                    b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
+            if not is_authenticated:
+                time.sleep(0.4)
         except Exception as e:
             print(f"[STREAM ERROR] Exception in generator: {e}")
             break
@@ -40,7 +47,7 @@ def index():
         return send_file(str(FRONTEND_DIST / "index.html"))
     return jsonify({
         "status": "online",
-        "system": "Secure AI Traffic Management System",
+        "system": "AI Intelligent Traffic Management System",
         "stream_url": "/video_feed",
         "api_status": "/api/status"
     })
@@ -55,48 +62,69 @@ def serve_frontend_assets(filename):
 
 @app.route('/video_feed')
 def video_feed():
-    """Live MJPEG video streaming route."""
-    return Response(generate_video_stream(),
+    """Live MJPEG video streaming route gated by authentication."""
+    token = request.args.get("token", "")
+    user = security_manager.verify_token(token) if token else None
+    is_auth = user is not None
+    return Response(generate_video_stream(is_auth),
                     mimetype='multipart/x-mixed-replace; boundary=frame')
 
 # ==================== Authentication & RBAC Routes ====================
 
+@app.route('/api/auth/register', methods=['POST'])
+def register():
+    """Registers a new traffic official account with salted password hashing."""
+    data = request.get_json(silent=True) or {}
+    email = data.get("email", "")
+    password = data.get("password", "")
+    name = data.get("name", "")
+    role = data.get("role", "OPERATOR").upper()
+
+    ok_email, clean_email_or_err = validate_email_format(email)
+    if not ok_email:
+        return jsonify({"error": clean_email_or_err}), 400
+
+    ok_pw, pw_err = validate_password_strength(password)
+    if not ok_pw:
+        return jsonify({"error": pw_err}), 400
+
+    if db_manager.get_user_by_email(clean_email_or_err):
+        return jsonify({"error": "An account with this email address already exists."}), 409
+
+    pw_hash, salt = hash_password(password)
+    created = db_manager.create_user(clean_email_or_err, pw_hash, salt, name, role)
+    if not created:
+        return jsonify({"error": "Failed to create user account."}), 500
+
+    security_manager.log_audit("USER_REGISTRATION", clean_email_or_err, role, {"name": name})
+    return jsonify({"success": True, "message": "Account created successfully. You can now log in."})
+
 @app.route('/api/auth/login', methods=['POST'])
 def login():
-    """Authenticates operator / admin credentials and returns signed session token."""
+    """Authenticates email and password credentials, returning signed session token."""
     data = request.get_json(silent=True) or {}
-    username = data.get("username", "").strip()
+    email = (data.get("email") or data.get("username") or "").strip()
     password = data.get("password", "").strip()
 
-    if username in USERS:
-        # Check salted hash
-        salt = b"salt_123"
-        hashed = hashlib.sha256(f"{password}_traffic_2026_salt_123".encode()).hexdigest()
-        user_info = USERS[username]
+    ok_email, clean_email_or_err = validate_email_format(email)
+    if not ok_email:
+        return jsonify({"error": clean_email_or_err}), 400
 
-        # For demo simplicity, accept standard passwords:
-        # admin: admin123, operator: op123, auditor: audit123
-        valid = False
-        if username == "admin" and password == "admin123":
-            valid = True
-        elif username == "operator" and password == "op123":
-            valid = True
-        elif username == "auditor" and password == "audit123":
-            valid = True
-
-        if valid:
-            token = security_manager.generate_token(username, user_info["role"])
-            security_manager.log_audit("USER_LOGIN", username, user_info["role"], {"status": "SUCCESS"})
+    user_doc = db_manager.get_user_by_email(clean_email_or_err)
+    if user_doc:
+        if verify_password(password, user_doc["salt"], user_doc["password_hash"]):
+            token = security_manager.generate_token(clean_email_or_err, user_doc["role"], user_doc.get("name", "Operator"))
+            security_manager.log_audit("USER_LOGIN", clean_email_or_err, user_doc["role"], {"status": "SUCCESS"})
             return jsonify({
                 "success": True,
                 "token": token,
-                "username": username,
-                "role": user_info["role"],
-                "name": user_info["name"]
+                "email": clean_email_or_err,
+                "role": user_doc["role"],
+                "name": user_doc.get("name", "Operator")
             })
 
-    security_manager.log_audit("FAILED_LOGIN_ATTEMPT", username, "UNKNOWN", {"ip": request.remote_addr})
-    return jsonify({"error": "Invalid username or password"}), 401
+    security_manager.log_audit("FAILED_LOGIN_ATTEMPT", clean_email_or_err, "UNKNOWN", {"ip": request.remote_addr})
+    return jsonify({"error": "Invalid email address or password."}), 401
 
 @app.route('/api/auth/me', methods=['GET'])
 @require_auth()
