@@ -50,7 +50,7 @@ An enterprise-grade urban traffic monitoring, violation detection, and adaptive 
 ### 1. Environment & Database Configuration
 Configure root `.env` (credentials remain strictly protected in `.gitignore`):
 ```env
-MONGO_URI=mongodb+srv://dharshanab1306_db_user:<db_password>@cluster0.b2uvuut.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0
+MONGO_URI=mongodb+srv://<db_username>:<db_password>@<cluster-url>.mongodb.net/?retryWrites=true&w=majority
 DB_NAME=traffic_management_db
 FLASK_PORT=5000
 ```
