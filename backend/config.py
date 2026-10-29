@@ -20,4 +20,10 @@ STATIC_DIR = BASE_DIR / "backend" / "static"
 VIOLATIONS_DIR = STATIC_DIR / "violations"
 MODEL_PATH = BASE_DIR / "backend" / "models" / "yolov5n.onnx"
 
+# Default Operator Credentials from .env
+DEFAULT_EMAIL = os.getenv("DEFAULT_EMAIL", "admin@traffic.gov.in")
+DEFAULT_PASSWORD = os.getenv("DEFAULT_PASSWORD", "Admin@2026")
+DEFAULT_NAME = os.getenv("DEFAULT_NAME", "System Administrator")
+DEFAULT_ROLE = os.getenv("DEFAULT_ROLE", "ADMIN")
+
 VIOLATIONS_DIR.mkdir(parents=True, exist_ok=True)

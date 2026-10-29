@@ -203,5 +203,17 @@ class TestAITrafficSystem(unittest.TestCase):
             self.assertEqual(resp.status_code, 200)
             self.assertEqual(resp.mimetype, "multipart/x-mixed-replace")
 
+    def test_13_default_session_credentials(self):
+        """Test that default session credentials endpoint returns valid token configured in env."""
+        from app import app
+        from config import DEFAULT_EMAIL
+        with app.test_client() as client:
+            resp = client.get("/api/auth/default-session")
+            self.assertEqual(resp.status_code, 200)
+            data = resp.get_json()
+            self.assertTrue(data["success"])
+            self.assertIn("token", data)
+            self.assertEqual(data["user"]["email"], DEFAULT_EMAIL.lower().strip())
+
 if __name__ == "__main__":
     unittest.main()

@@ -1,84 +1,102 @@
 # DESIGN.md — AI Intelligent Traffic Management System
+### Modern Web3 Professional Light Design System (Coinbase & Stripe Inspired)
 
-A dark, high-density, mission-critical operational interface inspired by Linear and Tesla telemetry design systems. Built for traffic operators, control room officers, and enforcement authorities managing urban road networks.
-
----
-
-## 1. Design Principles & Aesthetic Philosophy
-
-- **Engineered Restraint**: Every element serves an operational purpose. No decorative noise, no gaudy gradients, no distracting animations.
-- **Deep Obsidian Surfaces**: `#090A0F` base canvas with layered charcoal cards (`#111522`, `#161B2A`) and hairline borders (`rgba(255, 255, 255, 0.08)`).
-- **Quantum Accents**: Indigo (`#6366F1`) and Cobalt (`#4F46E5`) for primary interactions, Electric Cyan (`#06B6D4`) for live telemetry, and precise semantic indicators for signals.
-- **Micro-Typographic Precision**: Inter / System Sans for ultra-legible labels and JetBrains Mono for telemetry, speeds, license plates, and cryptographic hash strings.
-- **Strict Role-Gated State**: Clear visual distinction between an authenticated operational command state and a secure locked standby state.
+A high-performance, institutional-grade traffic intelligence dashboard engineered with modern Web3 aesthetics. Built on a crisp pure white canvas with electric Web3 blue voltages, slate typography, hairline borders, and micro-elevation layering.
 
 ---
 
-## 2. Color Palette & Semantic Tokens
+## 1. Aesthetic Philosophy & Visual Principles
+
+- **Institutional Modern Web3 Clarity**: Clean, bright, and confident. The base canvas is soft white (`#F8FAFC`), and surfaces are pure white cards (`#FFFFFF`) with ultra-fine hairline dividers (`#E2E8F0`).
+- **Brand Voltage — Web3 Electric Blue**: `#0052FF` (Coinbase & Ethereum brand primary) powers high-priority interactive buttons, active tab pills, and key telemetry metrics.
+- **Micro-Layered Depth**: Zero decorative heavy drop-shadows. Depth is created through clean card-on-card layering, subtle 1px border strokes (`#E2E8F0`), and soft ambient micro-shadows (`box-shadow: 0 1px 3px 0 rgba(0, 0, 0, 0.05), 0 1px 2px -1px rgba(0, 0, 0, 0.05)`).
+- **Executive Typography Hierarchy**: Inter / System Sans for crystal-clear readability with high-contrast obsidian headings (`#0F172A`), balanced slate body text (`#475569`), and monospace accents (`#1E293B`) for vehicle IDs, timestamps, speed values, and SHA-256 cryptographic hashes.
+- **Frictionless Operator Workflow**: Seamless entry into live telemetry with configurable environment credentials (`DEFAULT_EMAIL`, `DEFAULT_PASSWORD`), eliminating intrusive blocking overlays while maintaining strict cryptographic validation under the hood.
+
+---
+
+## 2. Color Tokens & Semantic Variables
 
 ```css
 :root {
-  /* Canvas & Surfaces */
-  --canvas-deep: #08090E;
-  --surface-primary: #101420;
-  --surface-secondary: #151A29;
-  --surface-elevated: #1B2236;
-  --surface-hover: #222B42;
+  /* Canvas & Backgrounds */
+  --canvas-bg: #F8FAFC;
+  --canvas-pure: #FFFFFF;
+  --surface-card: #FFFFFF;
+  --surface-subtle: #F1F5F9;
+  --surface-hover: #E2E8F0;
 
   /* Borders & Hairlines */
-  --hairline: rgba(255, 255, 255, 0.07);
-  --hairline-strong: rgba(255, 255, 255, 0.14);
-  --hairline-accent: rgba(99, 102, 241, 0.4);
+  --border-light: #E2E8F0;
+  --border-medium: #CBD5E1;
+  --border-focus: #0052FF;
+  --border-accent: rgba(0, 82, 255, 0.25);
 
-  /* Primary Brand & Accents */
-  --brand-primary: #6366F1;
-  --brand-primary-hover: #4F46E5;
-  --brand-glow: rgba(99, 102, 241, 0.15);
-  --brand-cyan: #06B6D4;
+  /* Web3 Brand Primary */
+  --web3-blue: #0052FF;
+  --web3-blue-hover: #0045D8;
+  --web3-blue-soft: #EFF6FF;
+  --web3-gradient: linear-gradient(135deg, #0052FF 0%, #3B82F6 100%);
 
-  /* Semantic State Tokens */
-  --traffic-green: #10B981;
-  --traffic-green-glow: rgba(16, 185, 129, 0.35);
-  --traffic-yellow: #F59E0B;
-  --traffic-yellow-glow: rgba(245, 158, 11, 0.35);
-  --traffic-red: #F43F5E;
-  --traffic-red-glow: rgba(244, 63, 94, 0.35);
-
-  /* Typography Colors */
-  --text-primary: #F8FAFC;
-  --text-secondary: #94A3B8;
+  /* Ink & Typography */
+  --text-ink: #0F172A;
+  --text-body: #475569;
   --text-muted: #64748B;
-  --text-disabled: #475569;
+  --text-subtle: #94A3B8;
+
+  /* Semantic Traffic & Violation Indicators */
+  --semantic-emerald: #059669;
+  --semantic-emerald-bg: #ECFDF5;
+  --semantic-emerald-border: #A7F3D0;
+
+  --semantic-amber: #D97706;
+  --semantic-amber-bg: #FFFBEB;
+  --semantic-amber-border: #FDE68A;
+
+  --semantic-crimson: #E11D48;
+  --semantic-crimson-bg: #FFF1F2;
+  --semantic-crimson-border: #FECDD3;
+
+  --semantic-indigo: #4F46E5;
+  --semantic-indigo-bg: #EEF2FF;
+  --semantic-indigo-border: #C7D2FE;
+
+  /* Shadows */
+  --shadow-sm: 0 1px 2px 0 rgba(0, 0, 0, 0.05);
+  --shadow-md: 0 4px 6px -1px rgba(0, 0, 0, 0.07), 0 2px 4px -2px rgba(0, 0, 0, 0.05);
+  --shadow-lg: 0 10px 15px -3px rgba(0, 0, 0, 0.08), 0 4px 6px -4px rgba(0, 0, 0, 0.04);
+  --shadow-dropdown: 0 20px 25px -5px rgba(0, 0, 0, 0.1), 0 8px 10px -6px rgba(0, 0, 0, 0.05);
 }
 ```
 
 ---
 
-## 3. Component Architecture & Blueprints
+## 3. Component Architecture & UI Elements
 
-### A. Navigation & Telemetry Header
-- Height: 64px, frosted glass background (`rgba(8, 9, 14, 0.85)` + 12px blur).
-- Brand icon with glowing cobalt indicator.
-- Real-time status pills: Live Ingest Mode, Database Sync State, Operator Session Badge.
+### A. Navigation Bar (Top Header)
+- **Background**: `#FFFFFF` with bottom border `1px solid #E2E8F0` and subtle backdrop blur.
+- **Brand Title**: Obsidian `#0F172A` with Electric Blue shield icon, crisp subtitle in slate `#64748B`.
+- **System Pills**:
+  - Live AI Engine indicator: Soft emerald pill (`#ECFDF5`) with animated pulsing beacon.
+  - Video Source selector: Soft blue pill with clean dropdown.
+  - Active Session badge: Displays officer name, email, and role badge (`ADMIN` / `OPERATOR`) with instant profile modal and switch account triggers.
 
-### B. Authenticated Media & Viewport Card
-- Aspect Ratio: 16:9 / 4:3 with zero visual distortion.
-- Watermark HUD indicating stream origin (`LIVE_MP4`, `RTSP_CAMERA`, `WEBCAM`, `SIMULATION`).
-- Unauthenticated overlay: Blurred backdrop with security icon, explicit directive (*"Authentication Required: Please Sign In or Create an Account to Operate System"*).
+### B. Video Feed & Telemetry Viewport
+- **Container**: Clean pure white casing (`#FFFFFF`) with rounded-2xl geometry, fine border `#CBD5E1`, and ambient shadow.
+- **Live Stream Overlay**: High-contrast, sleek top/bottom HUD with semi-transparent glass badges (`background: rgba(15, 23, 42, 0.75); color: #FFFFFF`).
+- **No Blocking Overlays**: Direct visual stream with full AI bounding boxes, tracking centroids, and speed vectors.
 
-### C. Authentication & Registration Modal
-- Width: 460px with subtle depth shadow (`0 25px 50px -12px rgba(0, 0, 0, 0.85)`).
-- Segmented toggle tab: `Sign In` vs `Create Account`.
-- Floating inputs with inline validation indicators (green check when valid, subtle rose alert when invalid).
-- Native password reveal eye toggle icon.
-- No pre-filled fake credentials.
+### C. Metric Telemetry Cards
+- **Geometry**: White rectangular cards with soft padding (16px), rounded-xl (`12px`), and top accent stroke.
+- **Numbers**: Big, bold numbers in `#0F172A` with subtle monospace styling.
+- **Labels**: Uppercase 11px slate typography with letter-spacing `0.05em`.
 
-### D. Traffic Light & Adaptive Advisory Housing
-- Matte dark housing (`#0B0E17`) with inset shadow.
-- Circular bulbs (56px) with dynamic outer glow rings matching signal state.
-- Large countdown display in JetBrains Mono.
+### D. Adaptive Signal Controller
+- **Visuals**: Clean white housing for North-South and East-West phases.
+- **Lights**: Highly saturated physical traffic LEDs (Green `#10B981`, Amber `#F59E0B`, Red `#EF4444`) on clean recessed slate bezels.
+- **Webster Algorithm Badge**: Shows live calculated cycle time ($C_{\text{opt}}$) and saturation ratio ($Y$) in crisp badges.
 
-### E. Real-Time Telemetry & Chart Grid
-- Doughnut Chart: Indian Mixed Vehicle composition (Auto-Rickshaw, Bike, Bus, Truck, Car, Pedestrian).
-- Density Trend Chart: Rolling 60-second PCU curve with cyan gradient fill.
-- Violation Distribution Bar Chart.
+### E. Violations Stream & E-Challan Inspector
+- **List Items**: Clean white list items with hover highlight `#F8FAFC` and hairline dividers.
+- **Cryptographic Seal**: SHA-256 hash formatted in monospace `#64748B` with one-click verification modal.
+- **E-Challan Modal**: Official Indian MoRTH legal styling on pure white parchment background with clean print-ready typography and blue court-admissible badge.

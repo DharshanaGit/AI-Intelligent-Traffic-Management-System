@@ -8,7 +8,7 @@ import re
 from functools import wraps
 from flask import request, jsonify, g
 from datetime import datetime
-from config import BASE_DIR
+from config import BASE_DIR, DEFAULT_EMAIL, DEFAULT_PASSWORD, DEFAULT_NAME, DEFAULT_ROLE
 from db_client import db_manager
 
 SECRET_KEY = "TRAFFIC_SECURE_KEY_LOCAL_DEV_2026_DO_NOT_EXPOSE"
@@ -69,9 +69,10 @@ def verify_password(password: str, salt: str, expected_hash: str) -> bool:
 
 # Seed default administrator accounts into database if empty
 def _ensure_default_accounts():
-    if not db_manager.get_user_by_email("admin@traffic.gov.in"):
-        p_hash, s = hash_password("Admin@2026")
-        db_manager.create_user("admin@traffic.gov.in", p_hash, s, "System Administrator", "ADMIN")
+    admin_email = (DEFAULT_EMAIL or "admin@traffic.gov.in").lower().strip()
+    if not db_manager.get_user_by_email(admin_email):
+        p_hash, s = hash_password(DEFAULT_PASSWORD or "Admin@2026")
+        db_manager.create_user(admin_email, p_hash, s, DEFAULT_NAME or "System Administrator", DEFAULT_ROLE or "ADMIN")
     if not db_manager.get_user_by_email("officer@traffic.gov.in"):
         p_hash, s = hash_password("Officer@2026")
         db_manager.create_user("officer@traffic.gov.in", p_hash, s, "Traffic Control Officer", "OPERATOR")
@@ -83,6 +84,21 @@ class SecurityManager:
         self.rate_limit_window = 60  # seconds
         self.max_requests_per_window = 120
         self.request_counts = {}  # ip -> [(timestamp, count)]
+
+    def get_default_session(self) -> dict:
+        """Returns signed session token for the configured default administrator in .env."""
+        email = (DEFAULT_EMAIL or "admin@traffic.gov.in").lower().strip()
+        name = DEFAULT_NAME or "System Administrator"
+        role = DEFAULT_ROLE or "ADMIN"
+        token = self.generate_token(email, role, name)
+        return {
+            "token": token,
+            "user": {
+                "email": email,
+                "name": name,
+                "role": role
+            }
+        }
 
     def generate_token(self, email: str, role: str, name: str = "Operator") -> str:
         """Generates cryptographically signed HMAC-SHA256 session token."""
