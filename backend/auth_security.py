@@ -23,10 +23,12 @@ USERS = {
 EMAIL_REGEX = re.compile(r'^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$')
 
 def validate_email_format(email: str) -> tuple[bool, str]:
-    """Validates that email follows standard format."""
+    """Validates that email follows standard format without uppercase characters."""
     if not email or not isinstance(email, str):
         return False, "Email address is required."
     clean = email.strip()
+    if re.search(r'[A-Z]', clean):
+        return False, "Uppercase letters are not allowed in email address. Please use only lowercase letters."
     if not EMAIL_REGEX.match(clean):
         return False, "Invalid email address format (e.g. officer@traffic.gov.in)."
     return True, clean.lower()
@@ -84,21 +86,12 @@ class SecurityManager:
         self.rate_limit_window = 60  # seconds
         self.max_requests_per_window = 120
         self.request_counts = {}  # ip -> [(timestamp, count)]
+        self.revoked_tokens = set()
 
-    def get_default_session(self) -> dict:
-        """Returns signed session token for the configured default administrator in .env."""
-        email = (DEFAULT_EMAIL or "admin@traffic.gov.in").lower().strip()
-        name = DEFAULT_NAME or "System Administrator"
-        role = DEFAULT_ROLE or "ADMIN"
-        token = self.generate_token(email, role, name)
-        return {
-            "token": token,
-            "user": {
-                "email": email,
-                "name": name,
-                "role": role
-            }
-        }
+    def revoke_token(self, token: str):
+        """Adds token to blacklist to enforce immediate revocation upon logout."""
+        if token:
+            self.revoked_tokens.add(token.strip())
 
     def generate_token(self, email: str, role: str, name: str = "Operator") -> str:
         """Generates cryptographically signed HMAC-SHA256 session token."""
@@ -115,8 +108,10 @@ class SecurityManager:
         return f"{header}.{payload}.{signature}"
 
     def verify_token(self, token: str) -> dict:
-        """Verifies integrity and expiry of authentication token."""
+        """Verifies integrity, revocation status and expiry of authentication token."""
         try:
+            if not token or token in self.revoked_tokens:
+                return None
             parts = token.split(".")
             if len(parts) != 3:
                 return None
@@ -160,7 +155,7 @@ class SecurityManager:
 security_manager = SecurityManager()
 
 def require_auth(roles=None):
-    """Decorator to enforce authentication and RBAC."""
+    """Decorator to enforce strict authentication and RBAC."""
     def decorator(f):
         @wraps(f)
         def decorated(*args, **kwargs):
@@ -171,21 +166,16 @@ def require_auth(roles=None):
             auth_header = request.headers.get("Authorization", "")
             token = ""
             if auth_header.startswith("Bearer "):
-                token = auth_header[7:]
+                token = auth_header[7:].strip()
             elif request.args.get("token"):
-                token = request.args.get("token")
+                token = request.args.get("token").strip()
 
-            # Public unauthenticated endpoints
-            if not token and request.method == "GET" and request.endpoint in ('serve_frontend_assets', 'index'):
-                g.user = {"sub": "guest", "role": "GUEST"}
-                return f(*args, **kwargs)
+            if not token:
+                return jsonify({"error": "Authentication required. Please log in or sign up."}), 401
 
-            user_data = security_manager.verify_token(token) if token else None
+            user_data = security_manager.verify_token(token)
             if not user_data:
-                if roles or request.endpoint not in ('serve_frontend_assets', 'index'):
-                    return jsonify({"error": "Authentication required. Please log in or sign up."}), 401
-                g.user = {"sub": "guest", "role": "GUEST"}
-                return f(*args, **kwargs)
+                return jsonify({"error": "Invalid or expired session token. Please log in again."}), 401
 
             g.user = user_data
             if roles and user_data.get("role") not in roles:

@@ -99,10 +99,14 @@ export default function App() {
   const fileInputRef = useRef(null);
 
   // Auth State
-  const [token, setToken] = useState(localStorage.getItem('traffic_jwt') || '');
+  const [token, setToken] = useState(() => localStorage.getItem('traffic_jwt') || '');
   const [user, setUser] = useState(() => {
-    const saved = localStorage.getItem('traffic_user');
-    return saved ? JSON.parse(saved) : { email: 'admin@traffic.gov.in', role: 'ADMIN', name: 'System Administrator' };
+    try {
+      const saved = localStorage.getItem('traffic_user');
+      return saved ? JSON.parse(saved) : null;
+    } catch (e) {
+      return null;
+    }
   });
 
   // Auth Form Fields
@@ -124,26 +128,10 @@ export default function App() {
 
   const getHeaders = () => token ? { 'Authorization': `Bearer ${token}` } : {};
 
-  // Auto-login on launch using configured default session
-  useEffect(() => {
-    if (!localStorage.getItem('traffic_jwt')) {
-      fetch(`${API_BASE}/api/auth/default-session`)
-        .then(r => r.json())
-        .then(data => {
-          if (data.success && data.token) {
-            setToken(data.token);
-            setUser(data.user);
-            localStorage.setItem('traffic_jwt', data.token);
-            localStorage.setItem('traffic_user', JSON.stringify(data.user));
-          }
-        })
-        .catch(err => console.warn('Default auth initialization:', err));
-    }
-  }, []);
-
   // Real-time SSE Live Alert Subscription
   useEffect(() => {
-    const sse = new EventSource(`${API_BASE}/api/alerts/stream`);
+    if (!token) return;
+    const sse = new EventSource(`${API_BASE}/api/alerts/stream?token=${encodeURIComponent(token)}`);
     sse.onmessage = (event) => {
       try {
         const newAlert = JSON.parse(event.data);
@@ -153,10 +141,11 @@ export default function App() {
       } catch (e) {}
     };
     return () => sse.close();
-  }, []);
+  }, [token]);
 
   // Fetch Telemetry Poll
   const refreshAllData = async () => {
+    if (!token) return;
     try {
       const [resStatus, resAnalytics, resViolations, resAlerts, resCams] = await Promise.all([
         fetch(`${API_BASE}/api/status`, { headers: getHeaders() }),
@@ -186,6 +175,7 @@ export default function App() {
   };
 
   useEffect(() => {
+    if (!token) return;
     refreshAllData();
     const interval = setInterval(refreshAllData, 2000);
     return () => clearInterval(interval);
@@ -388,10 +378,34 @@ export default function App() {
     }
   };
 
+  // Real-time Input Validation Handlers
+  const handleEmailChange = (val) => {
+    setEmailInput(val);
+    setAuthError('');
+    if (/[A-Z]/.test(val)) {
+      setEmailError('Uppercase letters are not allowed in email address. Please use only lowercase letters.');
+    } else if (val && !EMAIL_REGEX.test(val)) {
+      setEmailError('Please enter a valid lowercase email address.');
+    } else {
+      setEmailError('');
+    }
+  };
+
+  const handlePasswordChange = (val) => {
+    setPasswordInput(val);
+    setAuthError('');
+    if (val.length > 0 && val.length < 8) {
+      setPasswordError('Password must be at least 8 characters long.');
+    } else {
+      setPasswordError('');
+    }
+  };
+
   // Auth Handlers
   const handleLoginSubmit = async (e) => {
     e.preventDefault();
     setAuthError('');
+    if (emailError || passwordError) return;
     try {
       const res = await fetch(`${API_BASE}/api/auth/login`, {
         method: 'POST',
@@ -406,11 +420,14 @@ export default function App() {
         setUser(userData);
         localStorage.setItem('traffic_user', JSON.stringify(userData));
         setAuthModal(false);
+        setEmailInput('');
+        setPasswordInput('');
+        setShowPassword(false);
       } else {
-        setAuthError(data.error || 'Authentication failed.');
+        setAuthError(data.error || 'Authentication failed. Please verify credentials.');
       }
     } catch (err) {
-      setAuthError('Connection error.');
+      setAuthError('Connection error. Could not reach server.');
     }
   };
 
@@ -418,6 +435,7 @@ export default function App() {
     e.preventDefault();
     setAuthError('');
     setAuthSuccess('');
+    if (emailError || passwordError) return;
     try {
       const res = await fetch(`${API_BASE}/api/auth/register`, {
         method: 'POST',
@@ -431,21 +449,40 @@ export default function App() {
       });
       const data = await res.json();
       if (res.ok && data.success) {
-        setAuthSuccess('Account registered. Please sign in.');
+        setAuthSuccess('Account registered successfully. Please sign in.');
         setAuthTab('login');
+        setPasswordInput('');
+        setShowPassword(false);
       } else {
         setAuthError(data.error || 'Registration failed.');
       }
     } catch (err) {
-      setAuthError('Connection error.');
+      setAuthError('Connection error. Could not reach server.');
     }
   };
 
-  const handleLogout = () => {
+  const handleLogout = async () => {
+    try {
+      if (token) {
+        await fetch(`${API_BASE}/api/auth/logout`, {
+          method: 'POST',
+          headers: getHeaders()
+        });
+      }
+    } catch (e) {}
     setToken('');
+    setUser(null);
     localStorage.removeItem('traffic_jwt');
     localStorage.removeItem('traffic_user');
-    setUser({ email: '', role: 'GUEST', name: 'Guest' });
+    setEmailInput('');
+    setPasswordInput('');
+    setNameInput('');
+    setEmailError('');
+    setPasswordError('');
+    setAuthError('');
+    setAuthSuccess('');
+    setShowPassword(false);
+    setActiveTab('live');
   };
 
   // Status variables
@@ -463,17 +500,17 @@ export default function App() {
   const totalCounted = status?.traffic?.total_counted ?? 0;
   const queues = status?.traffic?.queue_estimates || { north: 0, south: 0, east: 0, west: 0 };
 
-  // Charts
+  // Real Charts - Strictly real-time telemetry (no fake mock arrays)
   const vehicleChartData = {
     labels: ['Cars', '2-Wheelers', 'Autos', 'Buses', 'Trucks', 'Pedestrians'],
     datasets: [{
       data: [
-        status?.traffic?.vehicle_counts?.Car || 14,
-        status?.traffic?.vehicle_counts?.Motorcycle || 8,
-        status?.traffic?.vehicle_counts?.['Auto-Rickshaw'] || 5,
-        status?.traffic?.vehicle_counts?.Bus || 2,
-        status?.traffic?.vehicle_counts?.Truck || 1,
-        status?.traffic?.vehicle_counts?.Person || 2
+        status?.traffic?.vehicle_counts?.Car || 0,
+        status?.traffic?.vehicle_counts?.Motorcycle || 0,
+        status?.traffic?.vehicle_counts?.['Auto-Rickshaw'] || 0,
+        status?.traffic?.vehicle_counts?.Bus || 0,
+        status?.traffic?.vehicle_counts?.Truck || 0,
+        status?.traffic?.vehicle_counts?.Person || 0
       ],
       backgroundColor: ['#0052FF', '#059669', '#D97706', '#DC2626', '#8B5CF6', '#0284C7'],
       borderWidth: 2,
@@ -482,10 +519,10 @@ export default function App() {
   };
 
   const densityChartData = {
-    labels: ['-30m', '-25m', '-20m', '-15m', '-10m', '-5m', 'Now'],
+    labels: analytics?.traffic_density_history?.labels?.length ? analytics.traffic_density_history.labels : ['Now'],
     datasets: [{
       label: 'PCU Density Index',
-      data: analytics?.density_trend || [12, 18, 26, 32, 29, 34, currentPCU || 22],
+      data: analytics?.traffic_density_history?.data?.length ? analytics.traffic_density_history.data : [currentPCU],
       fill: true,
       borderColor: '#0052FF',
       backgroundColor: 'rgba(0, 82, 255, 0.08)',
@@ -500,10 +537,10 @@ export default function App() {
     datasets: [{
       label: 'Infractions',
       data: [
-        violations.filter(v => v.violation_type === 'Red Light Jump').length || 6,
-        violations.filter(v => v.violation_type === 'Wrong-Way Driving').length || 2,
-        violations.filter(v => v.violation_type === 'Lane Crossing').length || 4,
-        violations.filter(v => v.violation_type === 'Overspeeding').length || 3
+        violations.filter(v => v.violation_type === 'Red Light Jump').length,
+        violations.filter(v => v.violation_type === 'Wrong-Way Driving').length,
+        violations.filter(v => v.violation_type === 'Lane Crossing').length,
+        violations.filter(v => v.violation_type === 'Overspeeding').length
       ],
       backgroundColor: ['#DC2626', '#D97706', '#0284C7', '#8B5CF6'],
       borderRadius: 4
@@ -519,6 +556,144 @@ export default function App() {
       y: { ticks: { color: '#64748B' }, grid: { color: '#F1F5F9' } }
     }
   };
+
+  // Full-Screen Authentication Gateway for unauthenticated visitors
+  if (!token || !user) {
+    return (
+      <div className="tcc-auth-gateway">
+        <div className="tcc-auth-card">
+          <div className="tcc-auth-brand-badge">
+            <Radio size={24} />
+          </div>
+          <h2 style={{ fontSize: '1.2rem', fontWeight: 800, textAlign: 'center', color: '#0F172A', marginBottom: '4px' }}>
+            AI Intelligent Traffic Management System
+          </h2>
+          <p style={{ fontSize: '0.74rem', color: '#64748B', textAlign: 'center', marginBottom: '20px' }}>
+            Urban Surveillance Operations Centre • Real-time AI Edge Processing
+          </p>
+
+          <div style={{ display: 'flex', background: '#F1F5F9', borderRadius: '8px', padding: '3px', marginBottom: '18px' }}>
+            <button 
+              type="button"
+              className={`tcc-btn ${authTab === 'login' ? 'tcc-btn-primary' : 'tcc-btn-secondary'}`}
+              style={{ flex: 1, height: '32px', border: 'none', borderRadius: '6px' }}
+              onClick={() => { setAuthTab('login'); setAuthError(''); setAuthSuccess(''); }}
+            >
+              Sign In
+            </button>
+            <button 
+              type="button"
+              className={`tcc-btn ${authTab === 'register' ? 'tcc-btn-primary' : 'tcc-btn-secondary'}`}
+              style={{ flex: 1, height: '32px', border: 'none', borderRadius: '6px' }}
+              onClick={() => { setAuthTab('register'); setAuthError(''); setAuthSuccess(''); }}
+            >
+              Create Account
+            </button>
+          </div>
+
+          {authSuccess && (
+            <div style={{ background: '#ECFDF5', border: '1px solid #A7F3D0', color: '#059669', padding: '10px', borderRadius: '6px', fontSize: '0.76rem', marginBottom: '14px', display: 'flex', alignItems: 'center', gap: '8px' }}>
+              <CheckCircle size={15} />
+              <span>{authSuccess}</span>
+            </div>
+          )}
+          {authError && (
+            <div style={{ background: '#FEF2F2', border: '1px solid #FECACA', color: '#DC2626', padding: '10px', borderRadius: '6px', fontSize: '0.76rem', marginBottom: '14px', display: 'flex', alignItems: 'center', gap: '8px' }}>
+              <AlertTriangle size={15} />
+              <span>{authError}</span>
+            </div>
+          )}
+
+          <form onSubmit={authTab === 'login' ? handleLoginSubmit : handleRegisterSubmit} autoComplete="off">
+            {authTab === 'register' && (
+              <div className="tcc-form-group">
+                <label className="tcc-form-label">Official Name</label>
+                <input 
+                  type="text" 
+                  className="tcc-form-input" 
+                  value={nameInput} 
+                  onChange={e => setNameInput(e.target.value)} 
+                  placeholder="Inspector Rajesh Verma" 
+                  autoComplete="off"
+                  required 
+                />
+              </div>
+            )}
+
+            <div className="tcc-form-group">
+              <label className="tcc-form-label">Official Email ID (lowercase only)</label>
+              <input 
+                type="email" 
+                className="tcc-form-input" 
+                value={emailInput} 
+                onChange={e => handleEmailChange(e.target.value)} 
+                placeholder="officer@traffic.gov.in" 
+                autoComplete="off"
+                required 
+              />
+              {emailError && (
+                <div style={{ color: '#DC2626', fontSize: '0.72rem', marginTop: '4px', fontWeight: 500 }}>
+                  {emailError}
+                </div>
+              )}
+            </div>
+
+            <div className="tcc-form-group">
+              <label className="tcc-form-label">Password</label>
+              <div style={{ position: 'relative' }}>
+                <input 
+                  type={showPassword ? 'text' : 'password'} 
+                  className="tcc-form-input" 
+                  value={passwordInput} 
+                  onChange={e => handlePasswordChange(e.target.value)} 
+                  placeholder="Enter secure password" 
+                  autoComplete={authTab === 'login' ? 'current-password' : 'new-password'}
+                  required 
+                  style={{ paddingRight: '40px' }}
+                />
+                <button 
+                  type="button" 
+                  onClick={() => setShowPassword(!showPassword)}
+                  style={{ position: 'absolute', right: '10px', top: '9px', background: 'none', border: 'none', cursor: 'pointer', color: '#64748B', display: 'flex', alignItems: 'center', justifyContent: 'center' }}
+                  title={showPassword ? "Hide password" : "Show password"}
+                >
+                  {showPassword ? <EyeOff size={16} /> : <Eye size={16} />}
+                </button>
+              </div>
+              {passwordError && (
+                <div style={{ color: '#DC2626', fontSize: '0.72rem', marginTop: '4px', fontWeight: 500 }}>
+                  {passwordError}
+                </div>
+              )}
+            </div>
+
+            {authTab === 'register' && (
+              <div className="tcc-form-group">
+                <label className="tcc-form-label">Duty Role</label>
+                <select 
+                  className="tcc-form-input" 
+                  value={roleInput} 
+                  onChange={e => setRoleInput(e.target.value)}
+                >
+                  <option value="OPERATOR">Traffic Control Officer (OPERATOR)</option>
+                  <option value="AUDITOR">Compliance Auditor (AUDITOR)</option>
+                </select>
+              </div>
+            )}
+
+            <button 
+              type="submit" 
+              className="tcc-btn tcc-btn-primary" 
+              style={{ width: '100%', height: '40px', marginTop: '12px', fontSize: '0.86rem', fontWeight: 600 }}
+              disabled={Boolean(emailError || passwordError || !emailInput || !passwordInput)}
+            >
+              {authTab === 'login' ? 'Authenticate Session' : 'Register Officer Account'}
+            </button>
+          </form>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div>
@@ -1610,19 +1785,17 @@ export default function App() {
               )}
 
               <div className="tcc-form-group">
-                <label className="tcc-form-label">Official Email ID</label>
+                <label className="tcc-form-label">Official Email ID (lowercase only)</label>
                 <input 
                   type="email" 
                   className="tcc-form-input" 
                   value={emailInput} 
-                  onChange={e => {
-                    setEmailInput(e.target.value);
-                    setEmailError(!EMAIL_REGEX.test(e.target.value) ? 'Invalid email format.' : '');
-                  }} 
+                  onChange={e => handleEmailChange(e.target.value)} 
                   placeholder="officer@traffic.gov.in" 
+                  autoComplete="off"
                   required 
                 />
-                {emailError && <div style={{ color: '#DC2626', fontSize: '0.7rem', marginTop: '2px' }}>{emailError}</div>}
+                {emailError && <div style={{ color: '#DC2626', fontSize: '0.72rem', marginTop: '4px', fontWeight: 500 }}>{emailError}</div>}
               </div>
 
               <div className="tcc-form-group">
@@ -1632,22 +1805,22 @@ export default function App() {
                     type={showPassword ? 'text' : 'password'} 
                     className="tcc-form-input" 
                     value={passwordInput} 
-                    onChange={e => {
-                      setPasswordInput(e.target.value);
-                      setPasswordError(e.target.value.length < 8 ? 'Min 8 characters required.' : '');
-                    }} 
+                    onChange={e => handlePasswordChange(e.target.value)} 
                     placeholder="Enter secure password" 
+                    autoComplete={authTab === 'login' ? 'current-password' : 'new-password'}
                     required 
+                    style={{ paddingRight: '40px' }}
                   />
                   <button 
                     type="button" 
                     onClick={() => setShowPassword(!showPassword)}
-                    style={{ position: 'absolute', right: '10px', top: '10px', background: 'none', border: 'none', cursor: 'pointer', color: '#64748B' }}
+                    style={{ position: 'absolute', right: '10px', top: '9px', background: 'none', border: 'none', cursor: 'pointer', color: '#64748B', display: 'flex', alignItems: 'center', justifyContent: 'center' }}
+                    title={showPassword ? "Hide password" : "Show password"}
                   >
-                    {showPassword ? <EyeOff size={15} /> : <Eye size={15} />}
+                    {showPassword ? <EyeOff size={16} /> : <Eye size={16} />}
                   </button>
                 </div>
-                {passwordError && <div style={{ color: '#DC2626', fontSize: '0.7rem', marginTop: '2px' }}>{passwordError}</div>}
+                {passwordError && <div style={{ color: '#DC2626', fontSize: '0.72rem', marginTop: '4px', fontWeight: 500 }}>{passwordError}</div>}
               </div>
 
               {authTab === 'register' && (
@@ -1658,14 +1831,18 @@ export default function App() {
                     value={roleInput} 
                     onChange={e => setRoleInput(e.target.value)}
                   >
-                    <option value="OPERATOR">Traffic Control Officer</option>
-                    <option value="AUDITOR">Compliance Auditor</option>
-                    <option value="ADMIN">System Administrator</option>
+                    <option value="OPERATOR">Traffic Control Officer (OPERATOR)</option>
+                    <option value="AUDITOR">Compliance Auditor (AUDITOR)</option>
                   </select>
                 </div>
               )}
 
-              <button type="submit" className="tcc-btn tcc-btn-primary" style={{ width: '100%', height: '38px', marginTop: '8px' }}>
+              <button 
+                type="submit" 
+                className="tcc-btn tcc-btn-primary" 
+                style={{ width: '100%', height: '38px', marginTop: '8px' }}
+                disabled={Boolean(emailError || passwordError || !emailInput || !passwordInput)}
+              >
                 {authTab === 'login' ? 'Authenticate Session' : 'Register Officer Account'}
               </button>
             </form>

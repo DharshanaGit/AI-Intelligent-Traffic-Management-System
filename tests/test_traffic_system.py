@@ -126,10 +126,19 @@ class TestAITrafficSystem(unittest.TestCase):
         self.assertEqual(alert["acknowledged_by"], "officer_sharma")
 
     def test_10_echallan_generation(self):
-        """Test legal E-Challan format and fine calculation."""
+        """Test legal E-Challan format and fine calculation with authentication."""
         from app import app
+        from auth_security import security_manager
+        token = security_manager.generate_token("officer@traffic.gov.in", "OPERATOR", "Officer")
+        headers = {"Authorization": f"Bearer {token}"}
+
         with app.test_client() as client:
-            res = client.get("/api/evidence/TEST-01/challan")
+            # Unauthenticated request must be rejected
+            unauth_res = client.get("/api/evidence/TEST-01/challan")
+            self.assertEqual(unauth_res.status_code, 401)
+
+            # Authenticated request succeeds
+            res = client.get("/api/evidence/TEST-01/challan", headers=headers)
             self.assertEqual(res.status_code, 200)
             data = res.get_json()
             self.assertTrue(data["challan_number"].startswith("ECH-"))
@@ -137,7 +146,7 @@ class TestAITrafficSystem(unittest.TestCase):
             self.assertTrue(data["court_admissible"])
 
     def test_11_email_auth_and_registration(self):
-        """Test email validation, password strength, user registration and login."""
+        """Test email validation, uppercase rejection, password strength, registration and login."""
         import time
         from auth_security import (
             validate_email_format, validate_password_strength,
@@ -149,6 +158,11 @@ class TestAITrafficSystem(unittest.TestCase):
         ok, res = validate_email_format("operator@traffic.gov.in")
         self.assertTrue(ok)
         self.assertEqual(res, "operator@traffic.gov.in")
+
+        # Uppercase letters in email must be rejected
+        ok_caps, msg_caps = validate_email_format("Admin@Traffic.Gov.In")
+        self.assertFalse(ok_caps)
+        self.assertIn("Uppercase", msg_caps)
 
         ok, msg = validate_email_format("invalid-email-address")
         self.assertFalse(ok)
@@ -166,7 +180,23 @@ class TestAITrafficSystem(unittest.TestCase):
 
         # 3. Register & Login API tests
         with app.test_client() as client:
-            # Registration
+            # Test uppercase rejection in API
+            caps_resp = client.post("/api/auth/register", json={
+                "email": "User@Traffic.Gov.In",
+                "password": "Password2026"
+            })
+            self.assertEqual(caps_resp.status_code, 400)
+            self.assertIn("Uppercase", caps_resp.get_json()["error"])
+
+            # Test admin self-registration without authorization blocked (403)
+            admin_reg_resp = client.post("/api/auth/register", json={
+                "email": "hacker_admin@traffic.gov.in",
+                "password": "Password2026",
+                "role": "ADMIN"
+            })
+            self.assertEqual(admin_reg_resp.status_code, 403)
+
+            # Legitimate operator registration
             test_email = f"test_{int(time.time())}@traffic.gov.in"
             reg_resp = client.post("/api/auth/register", json={
                 "email": test_email,
@@ -196,24 +226,46 @@ class TestAITrafficSystem(unittest.TestCase):
             self.assertIn("token", login_data)
 
     def test_12_gated_video_stream(self):
-        """Test that unauthenticated requests to video feed are marked unauthenticated."""
+        """Test that unauthenticated requests to video feed are rejected (401) and authenticated pass (200)."""
         from app import app
-        with app.test_client() as client:
-            resp = client.get("/video_feed")
-            self.assertEqual(resp.status_code, 200)
-            self.assertEqual(resp.mimetype, "multipart/x-mixed-replace")
+        from auth_security import security_manager
+        valid_token = security_manager.generate_token("officer@traffic.gov.in", "OPERATOR")
 
-    def test_13_default_session_credentials(self):
-        """Test that default session credentials endpoint returns valid token configured in env."""
-        from app import app
-        from config import DEFAULT_EMAIL
         with app.test_client() as client:
-            resp = client.get("/api/auth/default-session")
-            self.assertEqual(resp.status_code, 200)
-            data = resp.get_json()
-            self.assertTrue(data["success"])
-            self.assertIn("token", data)
-            self.assertEqual(data["user"]["email"], DEFAULT_EMAIL.lower().strip())
+            # Unauthenticated request rejected with 401
+            resp_unauth = client.get("/video_feed")
+            self.assertEqual(resp_unauth.status_code, 401)
+
+            # Authenticated stream request accepted with 200
+            resp_auth = client.get(f"/video_feed?token={valid_token}")
+            self.assertEqual(resp_auth.status_code, 200)
+            self.assertEqual(resp_auth.mimetype, "multipart/x-mixed-replace")
+
+    def test_13_token_revocation_and_unauthenticated_rejection(self):
+        """Test strict auth: 401 on unauthenticated data endpoints and token revocation on logout."""
+        from app import app
+        from auth_security import security_manager
+        token = security_manager.generate_token("officer@traffic.gov.in", "OPERATOR")
+        auth_headers = {"Authorization": f"Bearer {token}"}
+
+        with app.test_client() as client:
+            # 1. Unauthenticated requests must return 401
+            self.assertEqual(client.get("/api/status").status_code, 401)
+            self.assertEqual(client.get("/api/violations").status_code, 401)
+            self.assertEqual(client.get("/api/alerts").status_code, 401)
+            self.assertEqual(client.get("/api/analytics").status_code, 401)
+            self.assertEqual(client.get("/api/cameras").status_code, 401)
+
+            # 2. Authenticated requests succeed
+            self.assertEqual(client.get("/api/status", headers=auth_headers).status_code, 200)
+
+            # 3. Logout revokes token
+            logout_resp = client.post("/api/auth/logout", headers=auth_headers)
+            self.assertEqual(logout_resp.status_code, 200)
+            self.assertTrue(logout_resp.get_json()["success"])
+
+            # 4. Revoked token is rejected with 401
+            self.assertEqual(client.get("/api/status", headers=auth_headers).status_code, 401)
 
     def test_14_video_control_and_cameras(self):
         """Test video stream pause/resume/reconnect controls and camera management API."""
@@ -234,7 +286,7 @@ class TestAITrafficSystem(unittest.TestCase):
             self.assertEqual(res.get_json()["status"], "PLAYING")
 
             # Get cameras list
-            res_cams = client.get("/api/cameras")
+            res_cams = client.get("/api/cameras", headers=headers)
             self.assertEqual(res_cams.status_code, 200)
             cams = res_cams.get_json()["cameras"]
             self.assertGreaterEqual(len(cams), 1)
@@ -268,7 +320,7 @@ class TestAITrafficSystem(unittest.TestCase):
 
         with app.test_client() as client:
             # System Health
-            h_resp = client.get("/api/system/health")
+            h_resp = client.get("/api/system/health", headers=headers)
             self.assertEqual(h_resp.status_code, 200)
             h_data = h_resp.get_json()
             self.assertEqual(h_data["status"], "HEALTHY")

@@ -9,8 +9,8 @@ from pathlib import Path
 from werkzeug.utils import secure_filename
 from config import BASE_DIR
 
-ALLOWED_EXTENSIONS = {'.mp4', '.avi', '.mov', '.mkv'}
-MAX_UPLOAD_SIZE_BYTES = 100 * 1024 * 1024  # 100 MB
+ALLOWED_EXTENSIONS = {'.mp4', '.avi', '.mov', '.mkv', '.webm', '.flv', '.wmv', '.m4v', '.ts', '.3gp'}
+MAX_UPLOAD_SIZE_BYTES = 5000 * 1024 * 1024  # 5,000 MB (5 GB)
 
 # Block internal IP ranges for SSRF protection on RTSP
 BLOCKED_RTSP_HOSTS = {'127.0.0.1', 'localhost', '0.0.0.0', '169.254.169.254'}
@@ -360,42 +360,48 @@ class VideoSourceManager:
         return frame
 
 def validate_video_upload(file_storage, dest_folder: Path) -> Tuple[bool, str]:
-    """Validates uploaded video file for magic bytes, extension, size and OpenCV decode."""
+    """Validates uploaded video file for extension, size and OpenCV decode."""
+    if not file_storage or not file_storage.filename:
+        return False, "No file provided."
+
     filename = secure_filename(file_storage.filename)
     if not filename:
-        return False, "Invalid filename."
+        filename = f"upload_{int(time.time())}.mp4"
 
     ext = os.path.splitext(filename)[1].lower()
     if ext not in ALLOWED_EXTENSIONS:
-        return False, f"File extension '{ext}' not allowed. Must be MP4, AVI, or MOV."
+        return False, f"File extension '{ext}' not allowed. Must be MP4, AVI, MOV, MKV, WebM, or M4V."
 
     dest_path = dest_folder / filename
-    file_storage.save(str(dest_path))
+    try:
+        file_storage.save(str(dest_path))
+    except Exception as e:
+        return False, f"Failed to save uploaded file: {e}"
 
     size = os.path.getsize(str(dest_path))
     if size > MAX_UPLOAD_SIZE_BYTES:
         os.remove(str(dest_path))
-        return False, f"File size exceeds 100MB limit ({size // (1024*1024)}MB)."
+        return False, f"File size exceeds 5000MB limit ({size // (1024*1024)}MB)."
+
+    if size < 1000:
+        os.remove(str(dest_path))
+        return False, "Uploaded file is empty or corrupted."
 
     # Verify video decoding with OpenCV
-    test_cap = cv2.VideoCapture(str(dest_path))
-    opened = test_cap.isOpened()
-    ret, test_frame = test_cap.read() if opened else (False, None)
-    test_cap.release()
-
-    if not opened or not ret or test_frame is None:
-        # Fallback binary header check
-        try:
+    try:
+        test_cap = cv2.VideoCapture(str(dest_path))
+        opened = test_cap.isOpened()
+        test_cap.release()
+        if not opened:
+            # Fallback binary header check
             with open(str(dest_path), 'rb') as f:
-                header = f.read(256)
-                valid_magic = any(sig in header for sig in [b'ftyp', b'moov', b'mdat', b'RIFF', b'\x1aE\xdf\xa3', b'wide'])
+                header = f.read(512)
+                valid_magic = any(sig in header for sig in [b'ftyp', b'moov', b'mdat', b'RIFF', b'\x1aE\xdf\xa3', b'wide', b'matroska', b'FLV'])
                 if not valid_magic:
                     os.remove(str(dest_path))
-                    return False, "Uploaded file failed video verification (unsupported codec or corrupt video)."
-        except Exception as e:
-            if dest_path.exists():
-                os.remove(str(dest_path))
-            return False, f"Error validating video file: {e}"
+                    return False, "Uploaded file is not a supported video file."
+    except Exception as e:
+        print(f"[UPLOAD VERIFY WARNING] OpenCV test warning: {e}")
 
     return True, str(dest_path)
 

@@ -23,6 +23,7 @@ UPLOADS_DIR = BASE_DIR / "backend" / "uploads"
 UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
 
 app = Flask(__name__, static_folder=str(STATIC_DIR))
+app.config['MAX_CONTENT_LENGTH'] = 5000 * 1024 * 1024  # 5,000 MB (5 GB)
 CORS(app, resources={r"/*": {"origins": "*"}})
 
 def generate_video_stream(is_authenticated: bool):
@@ -33,10 +34,7 @@ def generate_video_stream(is_authenticated: bool):
             frame_bytes = traffic_engine.get_frame(is_authenticated=is_authenticated)
             yield (b'--frame\r\n'
                    b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
-            if not is_authenticated:
-                time.sleep(0.4)
-            else:
-                time.sleep(0.035)
+            time.sleep(0.035)
         except Exception as e:
             time.sleep(0.1)
 
@@ -64,25 +62,22 @@ def serve_frontend_assets(filename):
 
 @app.route('/video_feed')
 def video_feed():
-    """Live MJPEG video streaming route with seamless AI processing."""
-    token = request.args.get("token", "")
-    user = security_manager.verify_token(token) if token else None
-    # Live stream is active; authenticated user gets personalized audit logging
-    is_auth = (user is not None) or True
-    return Response(generate_video_stream(is_auth),
+    """Live MJPEG video streaming route strictly protected by session authentication."""
+    token = request.args.get("token", "").strip()
+    if not token and request.headers.get("Authorization", "").startswith("Bearer "):
+        token = request.headers.get("Authorization")[7:].strip()
+
+    if not token:
+        return jsonify({"error": "Authentication required to view live video feed."}), 401
+
+    user = security_manager.verify_token(token)
+    if not user:
+        return jsonify({"error": "Invalid or expired session token for video feed."}), 401
+
+    return Response(generate_video_stream(is_authenticated=True),
                     mimetype='multipart/x-mixed-replace; boundary=frame')
 
 # ==================== Authentication & RBAC Routes ====================
-
-@app.route('/api/auth/default-session', methods=['GET', 'POST'])
-def get_default_session():
-    """Returns signed session token for the default credentials configured in .env."""
-    session = security_manager.get_default_session()
-    return jsonify({
-        "success": True,
-        "token": session["token"],
-        "user": session["user"]
-    })
 
 @app.route('/api/auth/register', methods=['POST'])
 def register():
@@ -92,6 +87,14 @@ def register():
     password = data.get("password", "")
     name = data.get("name", "")
     role = data.get("role", "OPERATOR").upper()
+
+    # Enforce RBAC on administrator registration: only existing authenticated ADMIN can create ADMIN
+    if role == "ADMIN":
+        auth_header = request.headers.get("Authorization", "")
+        token = auth_header[7:].strip() if auth_header.startswith("Bearer ") else request.args.get("token", "").strip()
+        auth_user = security_manager.verify_token(token) if token else None
+        if not auth_user or auth_user.get("role") != "ADMIN":
+            return jsonify({"error": "Administrator privilege required to create an ADMIN account."}), 403
 
     ok_email, clean_email_or_err = validate_email_format(email)
     if not ok_email:
@@ -139,6 +142,17 @@ def login():
     security_manager.log_audit("FAILED_LOGIN_ATTEMPT", clean_email_or_err, "UNKNOWN", {"ip": request.remote_addr})
     return jsonify({"error": "Invalid email address or password."}), 401
 
+@app.route('/api/auth/logout', methods=['POST'])
+@require_auth()
+def logout():
+    """Revokes session token immediately and logs audit event."""
+    auth_header = request.headers.get("Authorization", "")
+    token = auth_header[7:].strip() if auth_header.startswith("Bearer ") else request.args.get("token", "").strip()
+    security_manager.revoke_token(token)
+    user = getattr(g, "user", {})
+    security_manager.log_audit("USER_LOGOUT", user.get("sub", "anon"), user.get("role", "UNKNOWN"), {"status": "REVOKED"})
+    return jsonify({"success": True, "message": "Successfully signed out. Session token revoked."})
+
 @app.route('/api/auth/me', methods=['GET'])
 @require_auth()
 def get_current_user():
@@ -148,12 +162,13 @@ def get_current_user():
 # ==================== Video Ingestion & Source Management ====================
 
 @app.route('/api/video/sources', methods=['GET'])
+@require_auth()
 def list_video_sources():
     """Returns available uploaded files and current source mode."""
     files = []
     if UPLOADS_DIR.exists():
         for f in os.listdir(str(UPLOADS_DIR)):
-            if f.endswith(('.mp4', '.avi', '.mov')):
+            if f.endswith(('.mp4', '.avi', '.mov', '.mkv', '.webm', '.m4v')):
                 files.append({
                     "filename": f,
                     "size_mb": round(os.path.getsize(str(UPLOADS_DIR / f)) / (1024 * 1024), 2),
@@ -231,6 +246,7 @@ def control_video():
 # ==================== Camera Management Routes ====================
 
 @app.route('/api/cameras', methods=['GET'])
+@require_auth()
 def get_cameras():
     """Returns list of registered traffic cameras."""
     return jsonify({
@@ -269,6 +285,7 @@ def activate_camera(cam_id):
 # ==================== Alert & Notification Routes ====================
 
 @app.route('/api/alerts', methods=['GET'])
+@require_auth()
 def get_alerts():
     """Returns recent alert notifications."""
     limit = request.args.get('limit', default=20, type=int)
@@ -294,6 +311,13 @@ def acknowledge_alert(alert_id):
 @app.route('/api/alerts/stream')
 def stream_alerts():
     """Server-Sent Events (SSE) pipe pushing real-time alerts to the browser."""
+    token = request.args.get("token", "").strip()
+    if not token and request.headers.get("Authorization", "").startswith("Bearer "):
+        token = request.headers.get("Authorization")[7:].strip()
+    user = security_manager.verify_token(token) if token else None
+    if not user:
+        return jsonify({"error": "Authentication required for real-time alert stream."}), 401
+
     client_q = alert_service.register_client()
 
     def event_stream():
@@ -309,6 +333,7 @@ def stream_alerts():
     return Response(event_stream(), mimetype="text/event-stream")
 
 @app.route('/api/evidence/<evidence_id>/challan', methods=['GET'])
+@require_auth()
 def generate_echallan(evidence_id):
     """Generates official verifiable E-Challan violation ticket."""
     violations = db_manager.get_recent_violations(limit=100)
@@ -347,11 +372,13 @@ def generate_echallan(evidence_id):
 # ==================== Core Status & Analytics API ====================
 
 @app.route('/api/status', methods=['GET'])
+@require_auth()
 def get_status():
     """Returns verified real-time traffic telemetry and system health."""
     return jsonify(traffic_engine.get_status())
 
 @app.route('/api/violations', methods=['GET'])
+@require_auth()
 def get_violations():
     """Returns immutable violation and ANPR evidence records."""
     limit = request.args.get('limit', default=30, type=int)
@@ -381,6 +408,7 @@ def review_violation(evidence_id):
     return jsonify({"error": "Evidence record not found or invalid status"}), 404
 
 @app.route('/api/analytics', methods=['GET'])
+@require_auth()
 def get_analytics():
     """Aggregates verified real data for Chart.js rendering."""
     status = traffic_engine.get_status()
@@ -494,6 +522,7 @@ def get_audit_logs():
     })
 
 @app.route('/api/system/health', methods=['GET'])
+@require_auth()
 def get_system_health():
     """Returns detailed real-time health diagnostics across all subsystems."""
     status = traffic_engine.get_status()
