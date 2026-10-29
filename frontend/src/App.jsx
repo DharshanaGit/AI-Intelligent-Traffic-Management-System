@@ -143,31 +143,18 @@ export default function App() {
     return () => sse.close();
   }, [token]);
 
-  // Fetch Telemetry Poll
+  // Fetch Telemetry Poll via Consolidated Endpoint (Prevents HTTP 429 & Request Flooding)
   const refreshAllData = async () => {
     if (!token) return;
     try {
-      const [resStatus, resAnalytics, resViolations, resAlerts, resCams] = await Promise.all([
-        fetch(`${API_BASE}/api/status`, { headers: getHeaders() }),
-        fetch(`${API_BASE}/api/analytics`, { headers: getHeaders() }),
-        fetch(`${API_BASE}/api/violations?limit=40`, { headers: getHeaders() }),
-        fetch(`${API_BASE}/api/alerts?limit=30`, { headers: getHeaders() }),
-        fetch(`${API_BASE}/api/cameras`, { headers: getHeaders() })
-      ]);
-
-      if (resStatus.ok) setStatus(await resStatus.json());
-      if (resAnalytics.ok) setAnalytics(await resAnalytics.json());
-      if (resViolations.ok) {
-        const vData = await resViolations.json();
-        setViolations(vData.violations || []);
-      }
-      if (resAlerts.ok) {
-        const aData = await resAlerts.json();
-        setAlerts(aData.alerts || []);
-      }
-      if (resCams.ok) {
-        const cData = await resCams.json();
-        setCameras(cData.cameras || []);
+      const res = await fetch(`${API_BASE}/api/telemetry/combined`, { headers: getHeaders() });
+      if (res.ok) {
+        const data = await res.json();
+        if (data.status) setStatus(data.status);
+        if (data.analytics) setAnalytics(data.analytics);
+        if (data.violations) setViolations(data.violations);
+        if (data.alerts) setAlerts(data.alerts);
+        if (data.cameras) setCameras(data.cameras);
       }
     } catch (err) {
       console.warn('Telemetry poll:', err.message);

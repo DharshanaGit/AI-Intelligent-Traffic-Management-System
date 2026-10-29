@@ -73,14 +73,29 @@ class TrafficEngine:
         self.worker_thread = threading.Thread(target=self._background_pipeline_worker, daemon=True)
         self.worker_thread.start()
 
+    def _letterbox(self, img: np.ndarray, target_size=(640, 640)) -> Tuple[np.ndarray, float, Tuple[int, int]]:
+        """Letterboxes frame with symmetric padding to preserve true aspect ratio."""
+        h, w = img.shape[:2]
+        tw, th = target_size
+        scale = min(tw / w, th / h)
+        nw, nh = int(round(w * scale)), int(round(h * scale))
+        resized = cv2.resize(img, (nw, nh), interpolation=cv2.INTER_LINEAR)
+        top = (th - nh) // 2
+        bottom = th - nh - top
+        left = (tw - nw) // 2
+        right = tw - nw - left
+        padded = cv2.copyMakeBorder(resized, top, bottom, left, right, cv2.BORDER_CONSTANT, value=(114, 114, 114))
+        return padded, scale, (left, top)
+
     def run_detection(self, frame: np.ndarray):
-        """Runs YOLOv5n ONNX inference on 640x480 frame."""
+        """Runs YOLOv5n ONNX inference with aspect-ratio preserving letterboxing."""
         self.frame_index += 1
         h, w = frame.shape[:2]
 
         if self.frame_index % (self.skip_frames + 1) == 0 or len(self.cached_boxes) == 0:
+            padded_img, scale, (pad_left, pad_top) = self._letterbox(frame, (640, 640))
             with self.net_lock:
-                blob = cv2.dnn.blobFromImage(frame, 1/255.0, (640, 640), swapRB=True, crop=False)
+                blob = cv2.dnn.blobFromImage(padded_img, 1/255.0, (640, 640), swapRB=True, crop=False)
                 self.net.setInput(blob)
                 outputs = self.net.forward()[0]
 
@@ -96,9 +111,14 @@ class TrafficEngine:
                     score = float(scores[class_id])
                     if score >= 0.28 and class_id in TARGET_VEHICLE_CLASSES:
                         cx, cy, bw, bh = row[0:4]
-                        x = int((cx - bw / 2) * (w / 640))
-                        y = int((cy - bh / 2) * (h / 640))
-                        boxes.append([x, y, int(bw * (w / 640)), int(bh * (h / 640))])
+                        # Inverse letterbox transformation
+                        orig_cx = (cx - pad_left) / scale
+                        orig_cy = (cy - pad_top) / scale
+                        orig_bw = bw / scale
+                        orig_bh = bh / scale
+                        x = int(max(0, orig_cx - orig_bw / 2))
+                        y = int(max(0, orig_cy - orig_bh / 2))
+                        boxes.append([x, y, int(orig_bw), int(orig_bh)])
                         confidences.append(float(conf * score))
                         class_ids.append(class_id)
 
@@ -111,8 +131,9 @@ class TrafficEngine:
                 for idx in indices.flatten():
                     bbox = boxes[idx]
                     raw_class = TARGET_VEHICLE_CLASSES[class_ids[idx]]
-                    # Indian Traffic Harmonization: Auto-Rickshaw detection heuristic
-                    # Auto-rickshaws have narrow track, compact size, aspect ratio ~0.65-0.78
+                    # Indian Traffic Harmonization: Documented Auto-Rickshaw geometric heuristic
+                    # Note: Pre-trained COCO lacks native 3-wheeler class.
+                    # Evaluated on narrow track, compact envelope, aspect ratio ~0.60-0.85
                     bw, bh = bbox[2], bbox[3]
                     aspect = float(bw) / float(bh) if bh > 0 else 1.0
                     if raw_class in ("Car", "Motorcycle") and 0.60 <= aspect <= 0.85 and 2000 < (bw * bh) < 12000:
@@ -127,7 +148,7 @@ class TrafficEngine:
         return self.cached_boxes, self.cached_confidences, self.cached_classes
 
     def update_tracking(self, frame: np.ndarray, boxes: List[list], classes: List[str]):
-        """Associates detections with persistent vehicle IDs and updates trajectory history."""
+        """Associates detections with persistent vehicle IDs using velocity-guided trajectory projection."""
         current_centroids = []
         for b in boxes:
             x, y, bw, bh = b
@@ -146,8 +167,15 @@ class TrafficEngine:
                 if vid in updated_ids:
                     continue
                 prev_cx, prev_cy = data["centroid"]
-                dist = np.hypot(cx - prev_cx, cy - prev_cy)
-                if dist < 60 and dist < min_dist:
+                vx, vy = data.get("velocity", (0.0, 0.0))
+                # Predict centroid based on velocity vector
+                pred_cx = prev_cx + vx
+                pred_cy = prev_cy + vy
+                dist = np.hypot(cx - pred_cx, cy - pred_cy)
+                
+                # Adaptive matching threshold
+                match_limit = max(60.0, min(140.0, float(bbox[2]) * 1.3))
+                if dist < match_limit and dist < min_dist:
                     min_dist = dist
                     matched_id = vid
 
@@ -155,8 +183,11 @@ class TrafficEngine:
                 # Update tracklet
                 v = self.tracked_vehicles[matched_id]
                 prev_pt = v["centroid"]
-                prev_time = v.get("last_seen_time", now - 0.05)
-                dt = max(0.01, now - prev_time)
+                prev_time = v.get("last_seen_time", now - 0.04)
+                dt = max(0.02, now - prev_time)
+                
+                # Update velocity vector
+                v["velocity"] = (cx - prev_pt[0], cy - prev_pt[1])
                 
                 # Calibrated Speed Calculation via Perspective Homography
                 calibrated_speed = calibration_engine.calculate_speed_kmh(prev_pt, (cx, cy), dt)
@@ -171,21 +202,28 @@ class TrafficEngine:
                 v["last_seen_time"] = now
                 v["disappeared"] = 0
                 updated_ids.add(matched_id)
+
+                # Check virtual tripwire for single ground-truth counting
+                if not v.get("counted", False) and prev_pt[1] < 280 <= cy:
+                    v["counted"] = True
+                    self.total_counted += 1
+
                 self._check_violations(frame, matched_id, v)
             else:
-                # New vehicle entering frame
+                # New vehicle tracklet
                 new_id = self.next_vehicle_id
                 self.next_vehicle_id += 1
-                self.total_counted += 1
                 self.tracked_vehicles[new_id] = {
                     "id": new_id,
                     "centroid": (cx, cy),
+                    "velocity": (0.0, 0.0),
                     "bbox": bbox,
                     "class_name": vtype,
                     "trajectory": [(cx, cy)],
                     "speed": None,
                     "last_seen_time": now,
                     "disappeared": 0,
+                    "counted": False,
                     "violations": set()
                 }
                 updated_ids.add(new_id)
@@ -403,7 +441,7 @@ class TrafficEngine:
                     boxes, confs, classes = self.run_detection(raw_frame)
                     self.update_tracking(raw_frame, boxes, classes)
                     self._calculate_queue_estimates()
-                    signal_decision_support.update_state(len(self.tracked_vehicles), self.vehicle_counts)
+                    signal_decision_support.update_state(len(self.tracked_vehicles), self.vehicle_counts, queue_estimates=self.queue_estimates)
                     annotated = self.annotate_frame(raw_frame, meta)
 
                     ret, buffer = cv2.imencode('.jpg', annotated, [int(cv2.IMWRITE_JPEG_QUALITY), 75])

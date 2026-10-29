@@ -205,7 +205,7 @@ def switch_video_source():
 @app.route('/api/video/upload', methods=['POST'])
 @require_auth(roles=["ADMIN", "OPERATOR"])
 def upload_video():
-    """Uploads and validates new traffic video file."""
+    """Uploads and validates new traffic video file, creating a tracked processing session."""
     if 'video' not in request.files:
         return jsonify({"error": "No video file provided in multipart form data."}), 400
 
@@ -214,18 +214,50 @@ def upload_video():
     if not ok:
         return jsonify({"error": path_or_err}), 400
 
+    # Create tracked session job
+    job = video_source_manager.create_video_job(path_or_err, os.path.basename(path_or_err))
+
     # Automatically set as active video source
     video_source_manager.set_source("UPLOAD", path_or_err)
     user = getattr(g, "user", {})
     security_manager.log_audit("UPLOAD_VIDEO_FILE", user.get("sub", "anon"), user.get("role", "UNKNOWN"), {
-        "filename": os.path.basename(path_or_err)
+        "filename": os.path.basename(path_or_err),
+        "job_id": job["job_id"]
     })
 
     return jsonify({
         "success": True,
         "message": "Video successfully uploaded and set as active source.",
-        "filename": os.path.basename(path_or_err)
+        "filename": os.path.basename(path_or_err),
+        "job": job
     })
+
+@app.route('/api/video/jobs', methods=['GET'])
+@require_auth()
+def list_video_jobs():
+    """Returns list of video processing jobs and their progress."""
+    return jsonify({
+        "success": True,
+        "jobs": video_source_manager.list_jobs()
+    })
+
+@app.route('/api/video/jobs/<job_id>', methods=['GET'])
+@require_auth()
+def get_video_job(job_id):
+    """Returns status and metrics for a specific video processing job."""
+    job = video_source_manager.get_job(job_id)
+    if job:
+        return jsonify({"success": True, "job": job})
+    return jsonify({"error": "Job ID not found"}), 404
+
+@app.route('/api/video/jobs/<job_id>/cancel', methods=['POST'])
+@require_auth(roles=["ADMIN", "OPERATOR"])
+def cancel_video_job(job_id):
+    """Cancels a long-running video processing session."""
+    ok = video_source_manager.cancel_job(job_id)
+    if ok:
+        return jsonify({"success": True, "job_id": job_id, "status": "CANCELLED"})
+    return jsonify({"error": "Job ID not found"}), 404
 
 @app.route('/api/video/control', methods=['POST'])
 @require_auth(roles=["ADMIN", "OPERATOR"])
@@ -370,6 +402,48 @@ def generate_echallan(evidence_id):
     return jsonify(challan)
 
 # ==================== Core Status & Analytics API ====================
+
+@app.route('/api/telemetry/combined', methods=['GET'])
+@require_auth()
+def get_combined_telemetry():
+    """Consolidated high-efficiency telemetry endpoint returning system state in a single call."""
+    status_data = traffic_engine.get_status()
+    violations_data = db_manager.get_recent_violations(limit=30)
+    alerts_data = alert_service.get_recent_alerts(limit=20)
+    cameras_data = video_source_manager.get_cameras()
+    jobs_data = video_source_manager.list_jobs()
+
+    # Dynamic analytics
+    history = db_manager.get_telemetry_history(limit=25)
+    violation_counts = {"Red Light Jump": 0, "Wrong-Way Driving": 0, "Overspeeding": 0}
+    for v in violations_data:
+        vtype = v.get("violation_type", "Other")
+        violation_counts[vtype] = violation_counts.get(vtype, 0) + 1
+
+    timestamps = [h.get("timestamp", "")[-8:-1] for h in history] or ["Now"]
+    pcu_values = [h.get("congestion_pcu", 0) for h in history] or [status_data["traffic"]["current_pcu"]]
+
+    return jsonify({
+        "status": status_data,
+        "violations": violations_data,
+        "alerts": alerts_data,
+        "cameras": cameras_data,
+        "jobs": jobs_data,
+        "analytics": {
+            "vehicle_composition": {
+                "labels": list(status_data["traffic"]["vehicle_counts"].keys()),
+                "data": list(status_data["traffic"]["vehicle_counts"].values())
+            },
+            "violation_breakdown": {
+                "labels": list(violation_counts.keys()),
+                "data": list(violation_counts.values())
+            },
+            "traffic_density_history": {
+                "labels": timestamps,
+                "data": pcu_values
+            }
+        }
+    })
 
 @app.route('/api/status', methods=['GET'])
 @require_auth()

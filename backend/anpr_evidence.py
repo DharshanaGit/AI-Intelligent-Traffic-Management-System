@@ -53,18 +53,29 @@ class ANPREvidenceManager:
                 break
 
         if plate_crop is not None:
-            # High-Security Registration Plate (HSRP) format simulation / OCR parsing
-            # Format: [State 2-char] [District 2-digit] [Series 1-2 char] [Number 4-digit]
-            state = np.random.choice(self.state_codes)
-            district = f"{np.random.randint(1, 99):02d}"
-            series = chr(np.random.randint(65, 90)) + chr(np.random.randint(65, 90))
-            number = f"{np.random.randint(1000, 9999)}"
-            plate_text = f"{state} {district} {series} {number}"
-            confidence = round(float(np.random.uniform(0.85, 0.98)), 2)
-            return plate_text, confidence, plate_crop
+            # Genuine Plate Character Candidate Verification
+            # Inspect internal character components to evaluate readability
+            plate_gray = cv2.cvtColor(plate_crop, cv2.COLOR_BGR2GRAY) if len(plate_crop.shape) == 3 else plate_crop
+            _, plate_thresh = cv2.threshold(plate_gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            char_contours, _ = cv2.findContours(plate_thresh, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+            
+            # Count valid character-like blobs (height > 30% of plate height)
+            ph = plate_crop.shape[0]
+            valid_char_blobs = 0
+            for cc in char_contours:
+                cx, cy, cw, ch = cv2.boundingRect(cc)
+                if ch >= ph * 0.35 and cw >= 3 and ch > cw:
+                    valid_char_blobs += 1
+
+            if valid_char_blobs >= 6:
+                # High-contrast characters present; without heavy Tesseract engine installed,
+                # mark verified plate detected and require human review rather than fabricating text
+                confidence = round(min(0.85, 0.40 + (valid_char_blobs * 0.05)), 2)
+                return "PLATE_DETECTED_REQUIRES_OCR", confidence, plate_crop
+            else:
+                return "PLATE_ZONE_OBSCURED", 0.35, plate_crop
         else:
-            # Fallback if no distinct plate contour
-            return "NO_PLATE_VISIBLE", 0.30, None
+            return "NO_PLATE_VISIBLE", 0.20, None
 
     def seal_and_store_evidence(self, frame: np.ndarray, vid: int, vtype: str, 
                                 vehicle_type: str, bbox: list, speed: Optional[float] = None) -> Dict[str, Any]:

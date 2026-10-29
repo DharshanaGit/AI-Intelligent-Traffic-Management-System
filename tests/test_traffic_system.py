@@ -334,5 +334,64 @@ class TestAITrafficSystem(unittest.TestCase):
             self.assertTrue(audit_data["success"])
             self.assertIsInstance(audit_data["logs"], list)
 
+    def test_16_combined_telemetry_and_video_jobs(self):
+        """Test unified telemetry polling endpoint and asynchronous video jobs registry."""
+        from app import app
+        from auth_security import security_manager
+        token = security_manager.generate_token("officer@traffic.gov.in", "OPERATOR", "Officer")
+        headers = {"Authorization": f"Bearer {token}"}
+
+        with app.test_client() as client:
+            # 1. Combined telemetry
+            res = client.get("/api/telemetry/combined", headers=headers)
+            self.assertEqual(res.status_code, 200)
+            data = res.get_json()
+            self.assertIn("status", data)
+            self.assertIn("violations", data)
+            self.assertIn("alerts", data)
+            self.assertIn("cameras", data)
+            self.assertIn("analytics", data)
+
+            # 2. Video jobs registry
+            jobs_res = client.get("/api/video/jobs", headers=headers)
+            self.assertEqual(jobs_res.status_code, 200)
+            jobs_data = jobs_res.get_json()
+            self.assertTrue(jobs_data["success"])
+            self.assertIsInstance(jobs_data["jobs"], list)
+
+    def test_17_homography_polygon_bounds(self):
+        """Test that perspective homography rejects points outside the calibrated road plane."""
+        from calibration_engine import calibration_engine
+        # Point inside calibration trap
+        inside_pt = (320, 350)
+        self.assertTrue(calibration_engine.is_inside_trap(inside_pt[0], inside_pt[1]))
+        w_in = calibration_engine.pixel_to_world(inside_pt[0], inside_pt[1])
+        self.assertIsNotNone(w_in)
+
+        # Point in sky/outside trap (e.g. y = 50)
+        outside_pt = (320, 50)
+        self.assertFalse(calibration_engine.is_inside_trap(outside_pt[0], outside_pt[1]))
+        w_out = calibration_engine.pixel_to_world(outside_pt[0], outside_pt[1])
+        self.assertIsNone(w_out)
+
+    def test_18_tiered_rate_limiting(self):
+        """Test that high-frequency telemetry is permitted while auth endpoints enforce strict defense."""
+        from auth_security import security_manager
+        test_ip = "192.168.100.99"
+
+        # Telemetry category allows up to 360 requests/min
+        allowed_count = 0
+        for _ in range(250):
+            if security_manager.check_rate_limit(test_ip, category="telemetry"):
+                allowed_count += 1
+        self.assertEqual(allowed_count, 250)
+
+        # Auth category rejects after 30 attempts
+        auth_allowed = 0
+        for _ in range(35):
+            if security_manager.check_rate_limit(test_ip, category="auth"):
+                auth_allowed += 1
+        self.assertEqual(auth_allowed, 30)
+
 if __name__ == "__main__":
     unittest.main()

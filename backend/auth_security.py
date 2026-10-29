@@ -13,6 +13,7 @@ from db_client import db_manager
 
 SECRET_KEY = "TRAFFIC_SECURE_KEY_LOCAL_DEV_2026_DO_NOT_EXPOSE"
 AUDIT_LOG_FILE = BASE_DIR / "backend" / "audit_trail.log"
+REVOKED_TOKENS_FILE = BASE_DIR / "backend" / "revoked_tokens.json"
 
 USERS = {
     "admin": {"role": "ADMIN", "name": "System Administrator"},
@@ -84,14 +85,34 @@ _ensure_default_accounts()
 class SecurityManager:
     def __init__(self):
         self.rate_limit_window = 60  # seconds
-        self.max_requests_per_window = 120
-        self.request_counts = {}  # ip -> [(timestamp, count)]
+        self.request_counts = {}  # (ip, category) -> [timestamps]
         self.revoked_tokens = set()
+        self._load_revoked_tokens()
+
+    def _load_revoked_tokens(self):
+        """Loads persisted revoked token hashes from disk."""
+        if REVOKED_TOKENS_FILE.exists():
+            try:
+                with open(str(REVOKED_TOKENS_FILE), "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    self.revoked_tokens = set(data.get("revoked_tokens", []))
+            except Exception as e:
+                print(f"[SECURITY WARNING] Could not read revoked tokens file: {e}")
+
+    def _save_revoked_tokens(self):
+        """Persists revoked token set to disk."""
+        try:
+            with open(str(REVOKED_TOKENS_FILE), "w", encoding="utf-8") as f:
+                json.dump({"revoked_tokens": list(self.revoked_tokens)}, f, indent=2)
+        except Exception as e:
+            print(f"[SECURITY WARNING] Could not persist revoked tokens: {e}")
 
     def revoke_token(self, token: str):
-        """Adds token to blacklist to enforce immediate revocation upon logout."""
+        """Adds token to blacklist to enforce immediate revocation upon logout with persistence."""
         if token:
-            self.revoked_tokens.add(token.strip())
+            clean = token.strip()
+            self.revoked_tokens.add(clean)
+            self._save_revoked_tokens()
 
     def generate_token(self, email: str, role: str, name: str = "Operator") -> str:
         """Generates cryptographically signed HMAC-SHA256 session token."""
@@ -127,14 +148,28 @@ class SecurityManager:
         except Exception:
             return None
 
-    def check_rate_limit(self, client_ip: str) -> bool:
-        """Sliding window in-memory rate limiter."""
+    def check_rate_limit(self, client_ip: str, category: str = "default") -> bool:
+        """
+        Sliding-window rate limiter with endpoint-tier classification:
+        - telemetry: 360 requests / minute (supports multi-card dashboard polling)
+        - upload: 30 uploads / minute
+        - auth: 30 attempts / minute (brute-force defense)
+        - default: 180 requests / minute
+        """
+        tier_limits = {
+            "telemetry": 360,
+            "upload": 30,
+            "auth": 30,
+            "default": 180
+        }
+        max_allowed = tier_limits.get(category, 180)
         now = time.time()
-        requests = self.request_counts.get(client_ip, [])
+        key = f"{client_ip}_{category}"
+        requests = self.request_counts.get(key, [])
         recent = [t for t in requests if now - t < self.rate_limit_window]
         recent.append(now)
-        self.request_counts[client_ip] = recent
-        return len(recent) <= self.max_requests_per_window
+        self.request_counts[key] = recent
+        return len(recent) <= max_allowed
 
     def log_audit(self, action: str, email: str, role: str, details: dict):
         """Appends immutable audit log entry for regulatory compliance."""
@@ -155,13 +190,25 @@ class SecurityManager:
 security_manager = SecurityManager()
 
 def require_auth(roles=None):
-    """Decorator to enforce strict authentication and RBAC."""
+    """Decorator to enforce strict authentication, RBAC, and contextual rate-limiting."""
     def decorator(f):
         @wraps(f)
         def decorated(*args, **kwargs):
             client_ip = request.remote_addr or "127.0.0.1"
-            if not security_manager.check_rate_limit(client_ip):
-                return jsonify({"error": "Too many requests. Rate limit exceeded."}), 429
+            path = request.path or ""
+
+            # Classify endpoint category for fair rate-limiting
+            if path.startswith(('/api/status', '/api/analytics', '/api/violations', '/api/alerts', '/api/cameras', '/api/video/sources', '/api/system')):
+                category = "telemetry"
+            elif path.startswith('/api/video/upload'):
+                category = "upload"
+            elif path.startswith('/api/auth'):
+                category = "auth"
+            else:
+                category = "default"
+
+            if not security_manager.check_rate_limit(client_ip, category=category):
+                return jsonify({"error": f"Too many requests for category '{category}'. Rate limit exceeded."}), 429
 
             auth_header = request.headers.get("Authorization", "")
             token = ""

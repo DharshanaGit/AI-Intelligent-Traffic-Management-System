@@ -43,9 +43,20 @@ class PerspectiveCalibration:
                 self.dst_points = np.float32(dst_pts)
             self._compute_homography()
 
+    def is_inside_trap(self, px: float, py: float) -> bool:
+        """Verifies if pixel point lies within calibrated road quadrilateral."""
+        if self.src_points is None or len(self.src_points) != 4:
+            return False
+        pts = self.src_points.reshape((-1, 1, 2)).astype(np.int32)
+        return cv2.pointPolygonTest(pts, (float(px), float(py)), False) >= 0
+
     def pixel_to_world(self, px: float, py: float) -> Optional[Tuple[float, float]]:
         """Converts pixel coordinate (x, y) to real-world ground coordinate (X_meters, Y_meters)."""
         if not self.is_calibrated or self.H_matrix is None:
+            return None
+        
+        # Guard against unbounded points outside calibration zone
+        if not self.is_inside_trap(px, py):
             return None
         
         pt = np.array([[[px, py]]], dtype=np.float32)
@@ -55,7 +66,7 @@ class PerspectiveCalibration:
 
     def calculate_speed_kmh(self, pt1: Tuple[float, float], pt2: Tuple[float, float], delta_time: float) -> Optional[float]:
         """Calculates calibrated vehicle velocity in km/h between two pixel points over time."""
-        if delta_time <= 0 or not self.is_calibrated:
+        if delta_time <= 0.001 or not self.is_calibrated:
             return None
 
         w1 = self.pixel_to_world(pt1[0], pt1[1])

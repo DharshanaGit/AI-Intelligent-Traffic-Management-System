@@ -31,11 +31,16 @@ class VideoSourceManager:
         self.measured_fps = 0.0
         self._fps_counter = 0
         self._fps_timer = time.time()
+        self.reconnect_attempts = 0
+        self.max_reconnect_attempts = 5
         
         # Threaded acquisition
         self.running = True
         self.current_frame = None
         self.worker_thread = None
+        
+        # Asynchronous Video Processing Job Queue
+        self.jobs: Dict[str, Dict[str, Any]] = {}
         
         # Procedural simulation generator
         self.sim_vehicles = []
@@ -226,6 +231,61 @@ class VideoSourceManager:
                 return res
         return {"success": False, "error": f"Camera {cam_id} not found."}
 
+    def create_video_job(self, file_path: str, filename: str) -> Dict[str, Any]:
+        """Registers a unique video processing session."""
+        job_id = f"JOB-{int(time.time()*1000)}-{os.urandom(3).hex().upper()}"
+        file_size_mb = 0.0
+        frame_count = 0
+        fps = 25.0
+        duration_s = 0.0
+
+        p = Path(file_path)
+        if p.exists():
+            file_size_mb = round(os.path.getsize(str(p)) / (1024 * 1024), 2)
+            try:
+                cap_probe = cv2.VideoCapture(str(p))
+                if cap_probe.isOpened():
+                    frame_count = int(cap_probe.get(cv2.CAP_PROP_FRAME_COUNT))
+                    fps_probe = cap_probe.get(cv2.CAP_PROP_FPS)
+                    if fps_probe and fps_probe > 1.0:
+                        fps = round(float(fps_probe), 1)
+                    duration_s = round(frame_count / fps, 1) if fps > 0 else 0.0
+                    cap_probe.release()
+            except Exception:
+                pass
+
+        job = {
+            "job_id": job_id,
+            "filename": filename,
+            "file_path": str(file_path),
+            "file_size_mb": file_size_mb,
+            "total_frames": frame_count,
+            "processed_frames": 0,
+            "fps": fps,
+            "duration_seconds": duration_s,
+            "status": "READY",  # READY, PROCESSING, COMPLETED, FAILED, CANCELLED
+            "progress_pct": 0,
+            "created_at": datetime.utcnow().isoformat() + "Z",
+            "error": None
+        }
+        self.jobs[job_id] = job
+        return job
+
+    def get_job(self, job_id: str) -> Optional[Dict[str, Any]]:
+        """Returns processing job details."""
+        return self.jobs.get(job_id)
+
+    def list_jobs(self) -> List[Dict[str, Any]]:
+        """Returns all registered processing jobs."""
+        return list(self.jobs.values())[::-1]
+
+    def cancel_job(self, job_id: str) -> bool:
+        """Cancels a video processing job."""
+        if job_id in self.jobs:
+            self.jobs[job_id]["status"] = "CANCELLED"
+            return True
+        return False
+
     def read_frame(self, is_authenticated: bool = True) -> Tuple[np.ndarray, Dict[str, Any]]:
         """Reads next frame and performs stream health analysis."""
         with self.lock:
@@ -236,6 +296,7 @@ class VideoSourceManager:
                 "frame_index": self.frame_index,
                 "fps": self.measured_fps,
                 "is_simulation": (self.mode == "SIMULATION"),
+                "is_replay": (self.mode == "UPLOAD"),
                 "is_authenticated": is_authenticated
             }
 
@@ -245,17 +306,25 @@ class VideoSourceManager:
                 metadata["health"] = "STANDBY"
                 return frame, metadata
 
-            if self.mode == "SIMULATION" or self.cap is None:
+            # Strictly explicit SIMULATION mode only - Never silent fallback
+            if self.mode == "SIMULATION":
                 frame = self._render_simulation_frame()
                 self.health_status = "SIMULATED"
                 metadata["health"] = self.health_status
                 return frame, metadata
 
+            # If capture is uninitialized or null, show DISCONNECTED error frame
+            if self.cap is None:
+                self.health_status = "DISCONNECTED"
+                metadata["health"] = self.health_status
+                frame = self._render_disconnected_fallback()
+                return frame, metadata
+
             # Read from real capture device or file
             ret, raw_frame = self.cap.read()
             if not ret or raw_frame is None:
-                # If reading from file, loop back to start
-                if self.mode == "UPLOAD" and self.cap is not None:
+                # If reading from uploaded file, loop back to start for continuous test replay
+                if self.mode == "UPLOAD":
                     self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
                     ret, raw_frame = self.cap.read()
                     if not ret or raw_frame is None:
@@ -265,11 +334,36 @@ class VideoSourceManager:
                         except Exception:
                             pass
 
+                # Live Camera (WEBCAM / RTSP) interruption handling
+                elif self.mode in ("WEBCAM", "RTSP"):
+                    self.reconnect_attempts += 1
+                    if self.reconnect_attempts <= self.max_reconnect_attempts:
+                        self.health_status = "RECONNECTING"
+                        metadata["health"] = self.health_status
+                        time.sleep(0.15)
+                        try:
+                            if self.mode == "WEBCAM":
+                                idx = int(self.source_path) if str(self.source_path).isdigit() else 0
+                                self.cap.open(idx)
+                            else:
+                                self.cap.open(self.source_path)
+                            ret, raw_frame = self.cap.read()
+                            if ret and raw_frame is not None:
+                                self.health_status = "HEALTHY"
+                                self.reconnect_attempts = 0
+                        except Exception:
+                            pass
+
                 if not ret or raw_frame is None:
                     self.health_status = "DISCONNECTED"
                     metadata["health"] = self.health_status
                     frame = self._render_disconnected_fallback()
                     return frame, metadata
+
+            # Successful frame read
+            self.reconnect_attempts = 0
+            if self.health_status in ("DISCONNECTED", "RECONNECTING"):
+                self.health_status = "HEALTHY"
 
             # Resize to standard 640x480 for consistent processing
             frame = cv2.resize(raw_frame, (640, 480))

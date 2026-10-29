@@ -41,37 +41,49 @@ class SignalDecisionSupport:
         )
         return round(float(pcu), 1)
 
-    def calculate_adaptive_timing(self, active_pcu: float, cross_street_pcu: float = 6.0) -> Dict[str, Any]:
+    def calculate_adaptive_timing(self, active_pcu: float, cross_street_pcu: float = 6.0, 
+                                  queue_estimates: Dict[str, int] = None) -> Dict[str, Any]:
         """
-        Calculates recommended Webster green interval based on real-time traffic density.
+        Calculates recommended Webster green interval based on real-time traffic density and approach queues.
         """
-        total_pcu = max(1.0, active_pcu + cross_street_pcu)
-        ratio = active_pcu / total_pcu
+        if queue_estimates:
+            ns_queue = max(1, queue_estimates.get("north", 0) + queue_estimates.get("south", 0))
+            ew_queue = max(1, queue_estimates.get("east", 0) + queue_estimates.get("west", 0))
+            total_queue = ns_queue + ew_queue
+            flow_ratio = ns_queue / total_queue
+        else:
+            total_pcu = max(1.0, active_pcu + cross_street_pcu)
+            flow_ratio = active_pcu / total_pcu
         
-        # Webster dynamic allocation
-        raw_green = 15.0 + (ratio * 40.0)
+        # Webster formula for optimum cycle length and phase split
+        # Total lost time L = 2 phases * (4s yellow + 2s all-red) = 12s
+        lost_time = 12.0
+        y_critical = min(0.85, max(0.15, flow_ratio * 0.75))
+        c_opt = (1.5 * lost_time + 5.0) / max(0.10, 1.0 - y_critical)
+        c_opt = max(40.0, min(120.0, c_opt))
+        
+        # Effective green allocation for dominant approach
+        raw_green = (c_opt - lost_time) * (y_critical / max(0.15, y_critical + 0.25))
         recommended_green = int(max(self.min_green, min(self.max_green, round(raw_green))))
         
         # Compute baseline delay vs adaptive delay
         fixed_time_delay = 30.0
         adaptive_time_delay = float(recommended_green)
         efficiency_gain_pct = round(abs(fixed_time_delay - adaptive_time_delay) / fixed_time_delay * 100, 1)
-        if recommended_green < 30:
-            efficiency_gain_pct = round((30 - recommended_green) / 30 * 100, 1)
-        else:
-            efficiency_gain_pct = round((recommended_green - 30) / 30 * 100, 1)
 
         return {
             "recommended_green_seconds": recommended_green,
             "min_clamp": self.min_green,
             "max_clamp": self.max_green,
             "active_pcu": active_pcu,
+            "optimum_cycle_length": int(c_opt),
             "efficiency_gain_pct": efficiency_gain_pct,
             "mode": "ADVISORY_DECISION_SUPPORT",
             "safety_interlock_engaged": True
         }
 
-    def update_state(self, active_vehicles: int, vehicle_counts: Dict[str, int]) -> Dict[str, Any]:
+    def update_state(self, active_vehicles: int, vehicle_counts: Dict[str, int], 
+                     queue_estimates: Dict[str, int] = None) -> Dict[str, Any]:
         """Progresses signal state machine according to adaptive decisions."""
         if self.manual_override:
             elapsed = time.time() - self.phase_start_time
@@ -111,8 +123,8 @@ class SignalDecisionSupport:
 
         elif self.current_phase == "RED":
             if elapsed >= self.allocated_duration:
-                # Re-calculate optimal green for next cycle
-                decision = self.calculate_adaptive_timing(active_pcu)
+                # Re-calculate optimal green for next cycle based on real approach queues
+                decision = self.calculate_adaptive_timing(active_pcu, queue_estimates=queue_estimates)
                 self.allocated_duration = decision["recommended_green_seconds"]
                 self.current_phase = "GREEN"
                 self.phase_start_time = time.time()
